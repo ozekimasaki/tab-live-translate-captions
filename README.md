@@ -10,6 +10,7 @@ npm run build
 ```
 
 ビルド後の拡張本体は `dist/` に出力されます。
+`dist/` は生成物なので Git では追跡しません。
 
 ## Load in Chrome
 
