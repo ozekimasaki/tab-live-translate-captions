@@ -27,6 +27,7 @@ export async function getSessionState() {
     result[STORAGE_KEYS.sessionState] || {
       status: SESSION_STATUS.idle,
       activeTabId: null,
+      translationProvider: null,
       message: "停止中"
     }
   );

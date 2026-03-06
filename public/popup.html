@@ -7,7 +7,7 @@
     <link rel="stylesheet" href="popup.css">
   </head>
   <body>
-    <main class="app">
+    <main id="appRoot" class="app" data-provider="cloud-translation">
       <header class="hero">
         <p class="eyebrow">Realtime Caption Overlay</p>
         <h1>ライブ翻訳字幕</h1>
@@ -38,13 +38,28 @@
         </div>
 
         <label class="field">
+          <span>翻訳プロバイダ</span>
+          <select id="translationProvider"></select>
+        </label>
+
+        <label class="field">
           <span>Deepgram API Key</span>
           <input id="deepgramApiKey" type="password" placeholder="dg_key..." autocomplete="off">
         </label>
 
-        <label class="field">
+        <label class="field provider-field" data-provider-field="cloud-translation">
+          <span>Cloud Translation API Key</span>
+          <input id="cloudTranslationApiKey" type="password" placeholder="AIza..." autocomplete="off">
+        </label>
+
+        <label class="field provider-field" data-provider-field="gemini">
           <span>Gemini API Key</span>
           <input id="geminiApiKey" type="password" placeholder="AIza..." autocomplete="off">
+        </label>
+
+        <label class="field provider-field" data-provider-field="gemini">
+          <span>Gemini モデル</span>
+          <select id="geminiModel"></select>
         </label>
       </section>
 

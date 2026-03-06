@@ -1,17 +1,30 @@
-import { DEFAULT_SETTINGS, MESSAGE_TYPES, PRESET_LANGUAGE_PAIRS, SESSION_STATUS } from "./constants.js";
+import {
+  DEFAULT_SETTINGS,
+  GEMINI_MODELS,
+  MESSAGE_TYPES,
+  PRESET_LANGUAGE_PAIRS,
+  SESSION_STATUS,
+  TRANSLATION_PROVIDERS
+} from "./constants.js";
 import { getTabSupport } from "./page-support.js";
 import { getSettings, getSessionState, saveSessionState, saveSettings } from "./storage.js";
 
 const OFFSCREEN_URL = chrome.runtime.getURL("offscreen.html");
 const OFFSCREEN_REASONS = ["USER_MEDIA"];
+const DEBUG_LOG_PREFIX = "[deepfram/background]";
+const IDLE_SESSION_STATE = {
+  status: SESSION_STATUS.idle,
+  activeTabId: null,
+  translationProvider: null,
+  message: "停止中"
+};
 
 chrome.runtime.onInstalled.addListener(async () => {
-  await saveSettings(await getSettings());
-  await setSessionState({
-    status: SESSION_STATUS.idle,
-    activeTabId: null,
-    message: "停止中"
-  });
+  await initializeRuntimeState();
+});
+
+chrome.runtime.onStartup.addListener(async () => {
+  await cleanupStaleSessionState("前回のセッションを自動で終了しました。");
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -74,7 +87,7 @@ async function handleMessage(message) {
 
 async function getPopupState() {
   const settings = await getSettings();
-  const sessionState = await getSessionState();
+  const sessionState = await getDisplaySessionState();
   const activeTab = await getActiveTab();
   const support = getTabSupport(activeTab?.url);
 
@@ -107,7 +120,7 @@ async function applySettings(inputSettings = {}) {
         await chrome.runtime.sendMessage({
           recipient: "offscreen",
           type: MESSAGE_TYPES.settingsUpdated,
-          settings
+          settings: buildLiveSessionSettingsPatch(settings)
         });
       } catch {
         // ignore offscreen wake-up timing noise
@@ -129,6 +142,8 @@ async function handleOverlayUpdated(overlayOffset) {
 }
 
 async function startSession(input = {}) {
+  await cleanupStaleSessionState();
+
   const settings = await saveSettings(normalizeSettings(input.settings || {}));
   validateSettings(settings);
 
@@ -136,6 +151,16 @@ async function startSession(input = {}) {
   if (!activeTab?.id) {
     throw new Error("アクティブタブを取得できませんでした。");
   }
+
+  debugLog("session:start", {
+    tabId: activeTab.id,
+    url: activeTab.url || "",
+    translationProvider: settings.translationProvider,
+    geminiModel: settings.translationProvider === TRANSLATION_PROVIDERS.gemini ? settings.geminiModel : null,
+    sourceLang: settings.sourceLang,
+    targetLang: settings.targetLang,
+    segmentationMode: settings.segmentationMode
+  });
 
   const support = getTabSupport(activeTab.url);
   if (!support.supported) {
@@ -156,6 +181,7 @@ async function startSession(input = {}) {
   await setSessionState({
     status: SESSION_STATUS.starting,
     activeTabId: activeTab.id,
+    translationProvider: settings.translationProvider,
     message: "接続を開始しています…"
   });
   await sendMessageToTab(activeTab.id, {
@@ -187,6 +213,7 @@ async function startSession(input = {}) {
     await setSessionState({
       status: SESSION_STATUS.error,
       activeTabId: activeTab.id,
+      translationProvider: settings.translationProvider,
       message: response?.error || "録音セッションの開始に失敗しました。"
     });
     throw new Error(response?.error || "録音セッションの開始に失敗しました。");
@@ -201,6 +228,33 @@ async function startSession(input = {}) {
 async function stopSession(message = "停止しました。") {
   const sessionState = await getSessionState();
   const activeTabId = sessionState.activeTabId;
+  const offscreenOpen = await hasOffscreenDocument();
+  debugLog("session:stop", {
+    activeTabId,
+    status: sessionState.status,
+    message,
+    offscreenOpen
+  });
+
+  if (sessionState.status !== SESSION_STATUS.idle) {
+    await setSessionState({
+      status: SESSION_STATUS.stopping,
+      activeTabId,
+      message: "停止しています…"
+    });
+  }
+
+  if (activeTabId == null && !offscreenOpen) {
+    await setSessionState({
+      status: SESSION_STATUS.idle,
+      activeTabId: null,
+      translationProvider: null,
+      message
+    });
+    return {
+      sessionState: await getSessionState()
+    };
+  }
 
   if (activeTabId != null) {
     await sendMessageToTab(activeTabId, {
@@ -208,7 +262,7 @@ async function stopSession(message = "停止しました。") {
     });
   }
 
-  if (await hasOffscreenDocument()) {
+  if (offscreenOpen) {
     try {
       await chrome.runtime.sendMessage({
         recipient: "offscreen",
@@ -228,6 +282,7 @@ async function stopSession(message = "停止しました。") {
   await setSessionState({
     status: SESSION_STATUS.idle,
     activeTabId: null,
+    translationProvider: null,
     message
   });
 
@@ -247,6 +302,14 @@ async function stopSession(message = "停止しました。") {
 async function handleOffscreenEvent(message) {
   const sessionState = await getSessionState();
   const activeTabId = sessionState.activeTabId;
+  if ([MESSAGE_TYPES.sessionStatusChanged, MESSAGE_TYPES.sessionError].includes(message.type)) {
+    debugLog("offscreen:event", {
+      type: message.type,
+      status: message.status || null,
+      error: message.error || null,
+      activeTabId
+    });
+  }
 
   if (activeTabId != null && [
     MESSAGE_TYPES.partialTranscript,
@@ -262,6 +325,7 @@ async function handleOffscreenEvent(message) {
     await setSessionState({
       status: message.status,
       activeTabId,
+      translationProvider: sessionState.translationProvider || null,
       message: message.message
     });
   }
@@ -270,6 +334,7 @@ async function handleOffscreenEvent(message) {
     await setSessionState({
       status: SESSION_STATUS.error,
       activeTabId,
+      translationProvider: sessionState.translationProvider || null,
       message: message.error || "処理中にエラーが発生しました。"
     });
   }
@@ -280,6 +345,11 @@ async function handleOffscreenEvent(message) {
 }
 
 async function ensureContentLayer(tabId) {
+  const isReady = await pingContentLayer(tabId);
+  if (isReady) {
+    return;
+  }
+
   await chrome.scripting.insertCSS({
     target: { tabId },
     files: ["content.css"]
@@ -302,6 +372,111 @@ async function hasOffscreenDocument() {
   });
 
   return contexts.length > 0;
+}
+
+async function initializeRuntimeState() {
+  await saveSettings(await getSettings());
+  await cleanupStaleSessionState("停止中", { force: true });
+}
+
+async function getDisplaySessionState() {
+  const sessionState = await getSessionState();
+  if (sessionState.status === SESSION_STATUS.idle) {
+    return sessionState;
+  }
+
+  const runtime = await getSessionRuntimeSnapshot(sessionState.activeTabId);
+  if (!shouldCleanupStaleSession(sessionState, runtime)) {
+    return sessionState;
+  }
+
+  return { ...IDLE_SESSION_STATE };
+}
+
+async function cleanupStaleSessionState(message = "停止中", { force = false } = {}) {
+  const sessionState = await getSessionState();
+  if (!force && sessionState.status === SESSION_STATUS.idle) {
+    return sessionState;
+  }
+
+  const activeTabId = sessionState.activeTabId;
+  const runtime = await getSessionRuntimeSnapshot(activeTabId);
+  const shouldReset = shouldCleanupStaleSession(sessionState, runtime, { force });
+
+  if (!shouldReset) {
+    return sessionState;
+  }
+
+  debugLog("session:cleanup-stale", {
+    force,
+    activeTabId,
+    status: sessionState.status,
+    offscreenOpen: runtime.offscreenOpen,
+    tabStillExists: runtime.tabStillExists
+  });
+
+  if (runtime.offscreenOpen) {
+    try {
+      await chrome.runtime.sendMessage({
+        recipient: "offscreen",
+        type: MESSAGE_TYPES.stopSession
+      });
+    } catch {
+      // ignore stale offscreen teardown noise
+    }
+
+    try {
+      await chrome.offscreen.closeDocument();
+    } catch {
+      // ignore already-closed state
+    }
+  }
+
+  if (activeTabId != null) {
+    await sendMessageToTab(activeTabId, {
+      type: MESSAGE_TYPES.clearOverlay
+    });
+  }
+
+  await setSessionState({
+    ...IDLE_SESSION_STATE,
+    message
+  });
+
+  return getSessionState();
+}
+
+async function getSessionRuntimeSnapshot(activeTabId) {
+  const [offscreenOpen, tabStillExists] = await Promise.all([
+    hasOffscreenDocument(),
+    activeTabId != null ? doesTabExist(activeTabId) : Promise.resolve(false)
+  ]);
+
+  return {
+    offscreenOpen,
+    tabStillExists
+  };
+}
+
+function shouldCleanupStaleSession(sessionState, runtime, { force = false } = {}) {
+  if (force) {
+    return true;
+  }
+
+  if (sessionState.status === SESSION_STATUS.idle) {
+    return false;
+  }
+
+  if (sessionState.activeTabId == null) {
+    return true;
+  }
+
+  if (!runtime.tabStillExists) {
+    return true;
+  }
+
+  // Offscreen document is the authoritative runtime for an active session.
+  return !runtime.offscreenOpen;
 }
 
 async function ensureOffscreenDocument() {
@@ -355,10 +530,30 @@ async function waitForTabCaptureRelease(tabId, timeoutMs = 1800) {
   throw new Error("前回のタブキャプチャが解放されるまで待機中です。");
 }
 
+async function doesTabExist(tabId) {
+  try {
+    await chrome.tabs.get(tabId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function sendMessageToTab(tabId, message) {
   try {
     await chrome.tabs.sendMessage(tabId, message);
     return true;
+  } catch {
+    return false;
+  }
+}
+
+async function pingContentLayer(tabId) {
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, {
+      type: MESSAGE_TYPES.contentPing
+    });
+    return Boolean(response?.ok);
   } catch {
     return false;
   }
@@ -388,7 +583,11 @@ function validateSettings(settings) {
     throw new Error("Deepgram API Key を入力してください。");
   }
 
-  if (!settings.geminiApiKey) {
+  if (settings.translationProvider === TRANSLATION_PROVIDERS.cloudTranslation && !settings.cloudTranslationApiKey) {
+    throw new Error("Cloud Translation API Key を入力してください。");
+  }
+
+  if (settings.translationProvider === TRANSLATION_PROVIDERS.gemini && !settings.geminiApiKey) {
     throw new Error("Gemini API Key を入力してください。");
   }
 
@@ -422,8 +621,29 @@ function normalizeSettings(settings) {
   merged.segmentationMode = ["latency", "balanced", "natural"].includes(merged.segmentationMode)
     ? merged.segmentationMode
     : DEFAULT_SETTINGS.segmentationMode;
+  merged.translationProvider = Object.values(TRANSLATION_PROVIDERS).includes(merged.translationProvider)
+    ? merged.translationProvider
+    : DEFAULT_SETTINGS.translationProvider;
+  merged.geminiModel = Object.values(GEMINI_MODELS).includes(merged.geminiModel)
+    ? merged.geminiModel
+    : DEFAULT_SETTINGS.geminiModel;
 
   return merged;
+}
+
+function buildLiveSessionSettingsPatch(settings) {
+  return {
+    translationProvider: settings.translationProvider,
+    geminiModel: settings.geminiModel,
+    sourceLang: settings.sourceLang,
+    targetLang: settings.targetLang,
+    displayMode: settings.displayMode,
+    segmentationMode: settings.segmentationMode,
+    showSourcePreview: settings.showSourcePreview,
+    overlayOpacity: settings.overlayOpacity,
+    overlayAnchor: settings.overlayAnchor,
+    overlayOffset: settings.overlayOffset
+  };
 }
 
 function normalizeOverlayOffset(offset = {}) {
@@ -444,4 +664,8 @@ async function getActiveTab() {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function debugLog(event, details = {}) {
+  console.info(DEBUG_LOG_PREFIX, event, details);
 }

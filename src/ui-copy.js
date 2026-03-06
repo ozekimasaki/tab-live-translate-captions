@@ -1,9 +1,21 @@
-import { DISPLAY_MODES, PRESET_LANGUAGE_PAIRS, SEGMENTATION_MODES, SESSION_STATUS } from "./constants.js";
+import {
+  DISPLAY_MODES,
+  GEMINI_MODELS,
+  PRESET_LANGUAGE_PAIRS,
+  SEGMENTATION_MODES,
+  SESSION_STATUS,
+  TRANSLATION_PROVIDERS
+} from "./constants.js";
 
 const LANGUAGE_LABELS = {
   en: "英語",
   ja: "日本語",
   zh: "中国語"
+};
+
+const PROVIDER_LABELS = {
+  [TRANSLATION_PROVIDERS.cloudTranslation]: "Cloud Translation",
+  [TRANSLATION_PROVIDERS.gemini]: "Gemini"
 };
 
 export const DISPLAY_MODE_OPTIONS = [
@@ -37,6 +49,32 @@ export const SEGMENTATION_MODE_OPTIONS = [
   }
 ];
 
+export const TRANSLATION_PROVIDER_OPTIONS = [
+  {
+    value: TRANSLATION_PROVIDERS.cloudTranslation,
+    label: "Cloud Translation",
+    description: "安定して速く翻訳する"
+  },
+  {
+    value: TRANSLATION_PROVIDERS.gemini,
+    label: "Gemini",
+    description: "生成モデルで翻訳する"
+  }
+];
+
+export const GEMINI_MODEL_OPTIONS = [
+  {
+    value: GEMINI_MODELS.flashLite25,
+    label: "Gemini 2.5 Flash Lite",
+    description: "安定寄りの lite モデル"
+  },
+  {
+    value: GEMINI_MODELS.flashLite31Preview,
+    label: "Gemini 3.1 Flash Lite Preview",
+    description: "preview モデルを試す"
+  }
+];
+
 export function getLanguageLabel(language) {
   return LANGUAGE_LABELS[language] || String(language || "").toUpperCase();
 }
@@ -57,8 +95,17 @@ export function getLanguagePairLabel(sourceLang, targetLang) {
   return `${getLanguageLabel(sourceLang)} → ${getLanguageLabel(targetLang)}`;
 }
 
+export function getTranslationProviderLabel(provider) {
+  return PROVIDER_LABELS[provider] || "Translation";
+}
+
 export function getPopupStatusModel({ settings, sessionState, support }) {
   const pairLabel = getLanguagePairLabel(settings.sourceLang, settings.targetLang);
+  const activeProvider = sessionState.translationProvider || settings.translationProvider;
+  const providerLabel = getTranslationProviderLabel(activeProvider);
+  const providerChangePending =
+    Boolean(sessionState.translationProvider) && sessionState.translationProvider !== settings.translationProvider;
+  const pendingProviderLabel = getTranslationProviderLabel(settings.translationProvider);
 
   if (!support.supported && sessionState.status !== SESSION_STATUS.active) {
     return {
@@ -66,7 +113,7 @@ export function getPopupStatusModel({ settings, sessionState, support }) {
       badge: "非対応",
       title: "このページでは開始できません",
       hint: support.reason,
-      pairLabel
+      pairLabel: `${providerLabel} · ${pairLabel}`
     };
   }
 
@@ -76,32 +123,38 @@ export function getPopupStatusModel({ settings, sessionState, support }) {
         state: "starting",
         badge: "接続中",
         title: sessionState.message || "音声処理を開始しています",
-        hint: "最初の字幕が表示されるまで数秒かかることがあります。",
-        pairLabel
+        hint: providerChangePending
+          ? `${providerLabel} で翻訳中です。${pendingProviderLabel} への切替は次回開始時に反映されます。`
+          : `${providerLabel} で翻訳します。最初の字幕が表示されるまで数秒かかることがあります。`,
+        pairLabel: `${providerLabel} · ${pairLabel}`
       };
     case SESSION_STATUS.active:
       return {
         state: "active",
         badge: "字幕中",
         title: sessionState.message || "翻訳字幕を表示しています",
-        hint: "ページ下部の字幕バーはドラッグ移動できます。",
-        pairLabel
+        hint: providerChangePending
+          ? `${providerLabel} で翻訳中です。${pendingProviderLabel} への切替は次回開始時に反映されます。`
+          : `${providerLabel} で翻訳中です。ページ下部の字幕バーはドラッグ移動できます。`,
+        pairLabel: `${providerLabel} · ${pairLabel}`
       };
     case SESSION_STATUS.error:
       return {
         state: "error",
         badge: "要確認",
         title: sessionState.message || "処理中にエラーが発生しました",
-        hint: "API キー、ネットワーク、対象タブの音声出力を確認してください。",
-        pairLabel
+        hint: providerChangePending
+          ? `${providerLabel} のエラーです。${pendingProviderLabel} への切替は次回開始時に反映されます。`
+          : `${providerLabel} の API キー、ネットワーク、対象タブの音声出力を確認してください。`,
+        pairLabel: `${providerLabel} · ${pairLabel}`
       };
     default:
       return {
         state: "idle",
         badge: "待機中",
         title: "開始すると現在のタブ音声を取得します",
-        hint: "通常の Web ページで使えます。字幕バーは透過や表示モードを変更できます。",
-        pairLabel
+        hint: `通常の Web ページで使えます。既定の翻訳は ${providerLabel} を使います。`,
+        pairLabel: `${providerLabel} · ${pairLabel}`
       };
   }
 }

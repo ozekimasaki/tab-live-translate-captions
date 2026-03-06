@@ -14,6 +14,16 @@ export const SEGMENTATION_MODES = {
   natural: "natural"
 };
 
+export const TRANSLATION_PROVIDERS = {
+  cloudTranslation: "cloud-translation",
+  gemini: "gemini"
+};
+
+export const GEMINI_MODELS = {
+  flashLite25: "gemini-2.5-flash-lite",
+  flashLite31Preview: "gemini-3.1-flash-lite-preview"
+};
+
 export const LANGUAGES = [
   { label: "英語", value: "en" },
   { label: "日本語", value: "ja" },
@@ -28,7 +38,10 @@ export const PRESET_LANGUAGE_PAIRS = [
 
 export const DEFAULT_SETTINGS = {
   deepgramApiKey: "",
+  translationProvider: TRANSLATION_PROVIDERS.cloudTranslation,
+  cloudTranslationApiKey: "",
   geminiApiKey: "",
+  geminiModel: GEMINI_MODELS.flashLite25,
   sourceLang: "en",
   targetLang: "ja",
   displayMode: DISPLAY_MODES.translationOnly,
@@ -52,6 +65,7 @@ export const SESSION_STATUS = {
 
 export const MESSAGE_TYPES = {
   getState: "GET_STATE",
+  contentPing: "CONTENT_PING",
   startSession: "START_SESSION",
   stopSession: "STOP_SESSION",
   settingsUpdated: "SETTINGS_UPDATED",

@@ -1,14 +1,16 @@
 import { DEFAULT_SETTINGS, DISPLAY_MODES, MESSAGE_TYPES, SESSION_STATUS } from "./constants.js";
 import { getLanguagePairLabel, getOverlayPlaceholder, getOverlayStatusLabel } from "./ui-copy.js";
 
+const preservedOverlayState = window.__deepframOverlayController?.exportState?.() || null;
+
 if (window.__deepframOverlayController?.destroy) {
   window.__deepframOverlayController.destroy();
 }
 
 window.__deepframContentLoaded = true;
-window.__deepframOverlayController = createDeepframOverlay();
+window.__deepframOverlayController = createDeepframOverlay(preservedOverlayState);
 
-function createDeepframOverlay() {
+function createDeepframOverlay(initialState = null) {
   const overlay = document.createElement("div");
   overlay.id = "deepfram-overlay";
   overlay.dataset.displayMode = DISPLAY_MODES.translationOnly;
@@ -43,10 +45,15 @@ function createDeepframOverlay() {
     </div>
   `;
 
-  const state = createInitialState();
+  const state = createInitialState(initialState);
   const elements = getElements(overlay);
-  const onMessage = (message) => {
+  const onMessage = (message, sender, sendResponse) => {
     if (!message?.type) {
+      return undefined;
+    }
+
+    if (message.type === MESSAGE_TYPES.contentPing) {
+      sendResponse({ ok: true });
       return undefined;
     }
 
@@ -102,6 +109,9 @@ function createDeepframOverlay() {
   }
 
   return {
+    exportState() {
+      return snapshotState(state);
+    },
     destroy() {
       chrome.runtime.onMessage.removeListener(onMessage);
       window.removeEventListener("resize", onResize);
@@ -185,11 +195,12 @@ function applyMessageToState(state, message) {
       return;
     case MESSAGE_TYPES.finalTranscript:
       state.sessionStatus = SESSION_STATUS.active;
-      state.statusText = "翻訳中";
-      state.sourceText = message.transcript || "";
-      state.translationSequenceId = Math.max(state.translationSequenceId, Number(message.sequenceId || 0));
+      state.statusText = "翻訳待ち";
       state.previewText = "";
       state.errorText = "";
+      if (!state.translationText) {
+        state.sourceText = message.transcript || "";
+      }
       return;
     case MESSAGE_TYPES.finalTranslation:
       if (Number(message.sequenceId || 0) < state.translationSequenceId) {
@@ -199,6 +210,7 @@ function applyMessageToState(state, message) {
       state.sessionStatus = SESSION_STATUS.active;
       state.translationSequenceId = Number(message.sequenceId || 0);
       state.statusText = message.isFinal ? "字幕表示中" : "翻訳を生成中";
+      state.sourceText = message.sourceText || state.sourceText;
       state.translationText = message.translation || "";
       state.errorText = "";
       return;
@@ -225,16 +237,38 @@ function clearState(state) {
   state.statusText = "待機中";
 }
 
-function createInitialState() {
+function createInitialState(snapshot = null) {
   return {
-    settings: { ...DEFAULT_SETTINGS },
-    sessionStatus: SESSION_STATUS.idle,
-    sourceText: "",
-    previewText: "",
-    translationText: "",
-    translationSequenceId: 0,
-    errorText: "",
-    statusText: "待機中"
+    settings: {
+      ...DEFAULT_SETTINGS,
+      ...(snapshot?.settings || {})
+    },
+    sessionStatus: snapshot?.sessionStatus || SESSION_STATUS.idle,
+    sourceText: snapshot?.sourceText || "",
+    previewText: snapshot?.previewText || "",
+    translationText: snapshot?.translationText || "",
+    translationSequenceId: Number(snapshot?.translationSequenceId || 0),
+    errorText: snapshot?.errorText || "",
+    statusText: snapshot?.statusText || "待機中"
+  };
+}
+
+function snapshotState(state) {
+  return {
+    settings: {
+      ...state.settings,
+      overlayOffset: {
+        x: Number(state.settings?.overlayOffset?.x || 0),
+        y: Number(state.settings?.overlayOffset?.y || 0)
+      }
+    },
+    sessionStatus: state.sessionStatus,
+    sourceText: state.sourceText,
+    previewText: state.previewText,
+    translationText: state.translationText,
+    translationSequenceId: state.translationSequenceId,
+    errorText: state.errorText,
+    statusText: state.statusText
   };
 }
 

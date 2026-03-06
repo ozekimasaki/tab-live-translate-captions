@@ -1,38 +1,67 @@
 import { createClient, LiveTranscriptionEvents } from "@deepgram/sdk";
-import { MESSAGE_TYPES, SESSION_STATUS } from "./constants.js";
+import { DEFAULT_SETTINGS, MESSAGE_TYPES, SESSION_STATUS, TRANSLATION_PROVIDERS } from "./constants.js";
 
 const DEEPGRAM_MODEL = "nova-3";
-const GEMINI_MODEL = "gemini-3.1-flash-lite-preview";
+const CLOUD_TRANSLATION_ENDPOINT = "https://translation.googleapis.com/language/translate/v2";
 const TARGET_SAMPLE_RATE = 16000;
 const KEEP_ALIVE_MS = 8000;
 const AUTO_STOP_MS = 5 * 60 * 1000;
 const GEMINI_MAX_OUTPUT_TOKENS = 64;
 const GEMINI_RETRY_DELAYS_MS = [180, 520];
+const MAX_CONCURRENT_TRANSLATIONS = 2;
 const TRANSLATION_UNAVAILABLE_TEXT = "翻訳を取得できませんでした。";
+const DEBUG_LOG_PREFIX = "[deepfram/offscreen]";
+const STREAMING_UPDATE_DEBOUNCE_MS = 140;
+const STREAMING_MIN_EMIT_CHARS = 6;
+const TOKEN_TIME_TOLERANCE_MS = 80;
+const BUFFER_COMPACT_THRESHOLD = 48;
+const HARD_BOUNDARY_PUNCTUATION_RE = /[.!?。！？]$/u;
+const SOFT_BOUNDARY_PUNCTUATION_RE = /[,;:、，；：]$/u;
+const SPACELESS_LANGUAGES = new Set(["ja", "zh"]);
+const ENGLISH_SOFT_BOUNDARY_CONTINUERS = new Set([
+  "and",
+  "but",
+  "or",
+  "so",
+  "because",
+  "if",
+  "when",
+  "that",
+  "to",
+  "of",
+  "a",
+  "an",
+  "the"
+]);
+const htmlEntityDecoder = document.createElement("textarea");
 const SEGMENTATION_PROFILES = {
   latency: {
-    endpointingMs: 160,
-    localSilenceMs: 180,
-    debounceMs: 180,
-    minChars: 4,
-    maxHoldMs: 700
+    endpointingMs: 180,
+    wordGapMs: 280,
+    softLookaheadMs: 140,
+    minWords: 3,
+    maxWords: 10,
+    maxDurationMs: 2200
   },
   balanced: {
-    endpointingMs: 220,
-    localSilenceMs: 320,
-    debounceMs: 280,
-    minChars: 8,
-    maxHoldMs: 900
+    endpointingMs: 260,
+    wordGapMs: 420,
+    softLookaheadMs: 260,
+    minWords: 4,
+    maxWords: 16,
+    maxDurationMs: 3200
   },
   natural: {
-    endpointingMs: 320,
-    localSilenceMs: 500,
-    debounceMs: 420,
-    minChars: 12,
-    maxHoldMs: 1300
+    endpointingMs: 380,
+    wordGapMs: 650,
+    softLookaheadMs: 420,
+    minWords: 5,
+    maxWords: 22,
+    maxDurationMs: 4600
   }
 };
 
+let nextSessionId = 1;
 let session = createEmptySession();
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -62,7 +91,7 @@ async function handleMessage(message) {
         ...session.settings,
         ...message.settings
       };
-      reschedulePendingTimers();
+      await reschedulePendingTimers();
       return {};
     case MESSAGE_TYPES.stopSession:
       await stopSession();
@@ -79,6 +108,15 @@ async function startSession({ tabId, streamId, settings }) {
   session.tabId = tabId;
   session.settings = settings;
   session.deepgram = createClient(settings.deepgramApiKey);
+  debugLog("session:start", {
+    sessionId: session.sessionId,
+    tabId,
+    translationProvider: settings.translationProvider,
+    geminiModel: settings.translationProvider === TRANSLATION_PROVIDERS.gemini ? getGeminiModel(settings) : null,
+    sourceLang: settings.sourceLang,
+    targetLang: settings.targetLang,
+    segmentationMode: settings.segmentationMode
+  });
 
   await notifyBackground({
     type: MESSAGE_TYPES.sessionStatusChanged,
@@ -161,6 +199,10 @@ async function startSession({ tabId, streamId, settings }) {
 
       if (!session.hasReceivedAudio) {
         session.hasReceivedAudio = true;
+        debugLog("audio:detected", {
+          sessionId: session.sessionId,
+          sampleRate: TARGET_SAMPLE_RATE
+        });
         notifyBackground({
           type: MESSAGE_TYPES.sessionStatusChanged,
           status: SESSION_STATUS.active,
@@ -168,16 +210,22 @@ async function startSession({ tabId, streamId, settings }) {
         });
       }
 
-      maybeFlushFromLocalSilence();
       session.connection.send(event.data.audioBuffer);
     };
 
     const segmentationProfile = getSegmentationProfile(settings.segmentationMode);
+    debugLog("deepgram:connect", {
+      sessionId: session.sessionId,
+      endpointingMs: segmentationProfile.endpointingMs,
+      wordGapMs: segmentationProfile.wordGapMs,
+      maxWords: segmentationProfile.maxWords
+    });
     session.connection = session.deepgram.listen.live({
       model: DEEPGRAM_MODEL,
       language: mapDeepgramLanguage(settings.sourceLang),
       punctuate: true,
       smart_format: true,
+      utterances: true,
       interim_results: true,
       endpointing: segmentationProfile.endpointingMs,
       utterance_end_ms: 1000,
@@ -197,6 +245,9 @@ async function startSession({ tabId, streamId, settings }) {
 
 function bindDeepgramEvents(connection) {
   connection.on(LiveTranscriptionEvents.Open, async () => {
+    debugLog("deepgram:open", {
+      sessionId: session.sessionId
+    });
     session.keepAliveTimer = setInterval(() => {
       connection.keepAlive();
     }, KEEP_ALIVE_MS);
@@ -209,51 +260,58 @@ function bindDeepgramEvents(connection) {
   });
 
   connection.on(LiveTranscriptionEvents.Transcript, async (payload) => {
-    const transcript = payload?.channel?.alternatives?.[0]?.transcript?.trim();
-    if (!transcript) {
-      return;
-    }
-
     resetAutoStopTimer();
+    const transcript = payload?.channel?.alternatives?.[0]?.transcript?.trim() || "";
 
     if (!payload.is_final) {
-      if (session.settings.showSourcePreview) {
-        await notifyBackground({
-          type: MESSAGE_TYPES.partialTranscript,
-          transcript: mergeTranscriptBuffer(session.pendingTranscriptText, transcript)
-        });
+      if (!transcript) {
+        return;
       }
+
+      session.latestInterimTail = trimKnownPrefix(transcript, getPendingFinalizedText());
+      maybeLogInterimProgress();
+      await publishPreviewTranscript();
       return;
     }
 
-    session.pendingTranscriptText = mergeTranscriptBuffer(session.pendingTranscriptText, transcript);
-    if (!session.pendingStartedAt) {
-      session.pendingStartedAt = Date.now();
-    }
-    await notifyBackground({
-      type: MESSAGE_TYPES.finalTranscript,
-      transcript: session.pendingTranscriptText,
-      sequenceId: session.sequenceId + 1
+    const finalTokens = extractFinalTokensFromPayload(payload, transcript);
+    session.latestInterimTail = "";
+    debugLog("deepgram:final", {
+      sessionId: session.sessionId,
+      transcriptChars: transcript.length,
+      tokenCount: finalTokens.length,
+      speechFinal: Boolean(payload.speech_final)
     });
 
+    appendFinalWordTokens(finalTokens);
+
     if (payload.speech_final) {
-      await flushPendingTranscript("speech-final");
+      await evaluatePendingBoundaries("speech-final", {
+        forceReason: "speech-final"
+      });
       return;
     }
 
-    if (endsWithSentenceBoundary(session.pendingTranscriptText)) {
-      schedulePunctuationFlush();
-    } else {
-      maybeFlushFromLocalSilence();
-      scheduleMaxHoldFlush();
-    }
+    await evaluatePendingBoundaries("final");
   });
 
-  connection.on(LiveTranscriptionEvents.UtteranceEnd, async () => {
-    await flushPendingTranscript("utterance-end");
+  connection.on(LiveTranscriptionEvents.UtteranceEnd, async (payload) => {
+    debugLog("deepgram:utterance-end", {
+      sessionId: session.sessionId,
+      lastWordEndMs: toMilliseconds(payload?.last_word_end)
+    });
+    session.latestInterimTail = "";
+    await evaluatePendingBoundaries("utterance-end", {
+      forceReason: "utterance-end",
+      utteranceEndMs: toMilliseconds(payload?.last_word_end)
+    });
   });
 
   connection.on(LiveTranscriptionEvents.Error, async (error) => {
+    debugLog("deepgram:error", {
+      sessionId: session.sessionId,
+      message: error?.message || String(error)
+    });
     await handleFatalError(error);
   });
 
@@ -262,24 +320,23 @@ function bindDeepgramEvents(connection) {
       return;
     }
 
-    await notifyBackground({
-      type: MESSAGE_TYPES.sessionStatusChanged,
-      status: SESSION_STATUS.error,
-      message: "Deepgram 接続が終了しました。"
+    debugLog("deepgram:close", {
+      sessionId: session.sessionId
     });
+    await handleFatalError(new Error("Deepgram 接続が終了しました。"));
   });
 }
 
-async function streamTranslateWithGemini({ apiKey, sourceLang, targetLang, text, signal, onUpdate }) {
+async function streamTranslateWithGemini({ apiKey, model, sourceLang, targetLang, text, signal, onUpdate }) {
   const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:streamGenerateContent?alt=sse`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`,
     {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "x-goog-api-key": apiKey
       },
-      body: JSON.stringify(buildGeminiRequestBody(sourceLang, targetLang, text)),
+      body: JSON.stringify(buildGeminiRequestBody(model, sourceLang, targetLang, text)),
       signal
     }
   );
@@ -287,7 +344,14 @@ async function streamTranslateWithGemini({ apiKey, sourceLang, targetLang, text,
   if (!response.ok) {
     const bodyText = await response.text();
     if (response.status === 400 || response.status === 404) {
-      const fallbackText = await translateWithGemini({ apiKey, sourceLang, targetLang, text, disableThinking: true });
+      const fallbackText = await translateWithGemini({
+        apiKey,
+        model,
+        sourceLang,
+        targetLang,
+        text,
+        disableThinking: true
+      });
       await onUpdate(fallbackText, true);
       return fallbackText;
     }
@@ -333,7 +397,7 @@ async function streamTranslateWithGemini({ apiKey, sourceLang, targetLang, text,
 
   assembledText = assembledText.trim();
   if (!assembledText) {
-    const fallbackText = await translateWithGemini({ apiKey, sourceLang, targetLang, text });
+    const fallbackText = await translateWithGemini({ apiKey, model, sourceLang, targetLang, text });
     await onUpdate(fallbackText, true);
     return fallbackText;
   }
@@ -342,7 +406,7 @@ async function streamTranslateWithGemini({ apiKey, sourceLang, targetLang, text,
   return assembledText;
 }
 
-async function translateWithGeminiBestEffort({ apiKey, sourceLang, targetLang, text, signal, onUpdate }) {
+async function translateWithGeminiBestEffort({ apiKey, model, sourceLang, targetLang, text, signal, onUpdate }) {
   let lastError = null;
   let latestPartial = "";
 
@@ -357,6 +421,7 @@ async function translateWithGeminiBestEffort({ apiKey, sourceLang, targetLang, t
   try {
     return await streamTranslateWithGemini({
       apiKey,
+      model,
       sourceLang,
       targetLang,
       text,
@@ -378,6 +443,7 @@ async function translateWithGeminiBestEffort({ apiKey, sourceLang, targetLang, t
     try {
       const translation = await translateWithGemini({
         apiKey,
+        model,
         sourceLang,
         targetLang,
         text,
@@ -402,7 +468,62 @@ async function translateWithGeminiBestEffort({ apiKey, sourceLang, targetLang, t
   throw lastError || new Error("Gemini から翻訳結果を取得できませんでした。");
 }
 
-function buildGeminiRequestBody(sourceLang, targetLang, text, { disableThinking = false } = {}) {
+async function translateWithProviderBestEffort({ provider, apiKey, model, sourceLang, targetLang, text, signal, onUpdate }) {
+  if (provider === TRANSLATION_PROVIDERS.cloudTranslation) {
+    return translateWithCloudTranslation({
+      apiKey,
+      sourceLang,
+      targetLang,
+      text,
+      signal,
+      onUpdate
+    });
+  }
+
+  return translateWithGeminiBestEffort({
+    apiKey,
+    model,
+    sourceLang,
+    targetLang,
+    text,
+    signal,
+    onUpdate
+  });
+}
+
+async function translateWithCloudTranslation({ apiKey, sourceLang, targetLang, text, signal, onUpdate }) {
+  const response = await fetch(`${CLOUD_TRANSLATION_ENDPOINT}?key=${encodeURIComponent(apiKey)}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      q: text,
+      source: mapTranslationLanguage(TRANSLATION_PROVIDERS.cloudTranslation, sourceLang),
+      target: mapTranslationLanguage(TRANSLATION_PROVIDERS.cloudTranslation, targetLang),
+      format: "text"
+    }),
+    signal
+  });
+
+  if (!response.ok) {
+    const bodyText = await response.text();
+    throw new Error(`Cloud Translation API ${response.status}: ${bodyText}`);
+  }
+
+  const data = await response.json();
+  const translatedText = decodeHtmlEntities(data?.data?.translations?.[0]?.translatedText || "");
+  const normalizedText = normalizeModelText(translatedText);
+
+  if (!normalizedText) {
+    throw new Error("Cloud Translation から翻訳結果を取得できませんでした。");
+  }
+
+  await onUpdate(normalizedText, true);
+  return normalizedText;
+}
+
+function buildGeminiRequestBody(model, sourceLang, targetLang, text, { disableThinking = false } = {}) {
   const body = {
     contents: [
       {
@@ -420,7 +541,7 @@ function buildGeminiRequestBody(sourceLang, targetLang, text, { disableThinking 
   };
 
   if (!disableThinking) {
-    body.generationConfig.thinkingConfig = isGemini3Model(GEMINI_MODEL)
+    body.generationConfig.thinkingConfig = isGemini3Model(model)
       ? {
           thinkingLevel: "minimal"
         }
@@ -500,15 +621,15 @@ function isGemini3Model(modelName) {
   return modelName.startsWith("gemini-3");
 }
 
-async function translateWithGemini({ apiKey, sourceLang, targetLang, text, disableThinking = false, signal } = {}) {
+async function translateWithGemini({ apiKey, model, sourceLang, targetLang, text, disableThinking = false, signal } = {}) {
   const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
     {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
       },
-      body: JSON.stringify(buildGeminiRequestBody(sourceLang, targetLang, text, { disableThinking })),
+      body: JSON.stringify(buildGeminiRequestBody(model, sourceLang, targetLang, text, { disableThinking })),
       signal
     }
   );
@@ -535,7 +656,13 @@ async function translateWithGemini({ apiKey, sourceLang, targetLang, text, disab
 
 function buildTranslationPrompt(sourceLang, targetLang, text) {
   return [
-    `Live subtitle translation: ${labelForLanguage(sourceLang)} -> ${labelForLanguage(targetLang)}.`,
+    `You are a professional live subtitle translator.`,
+    `Translate from ${labelForLanguage(sourceLang)} to ${labelForLanguage(targetLang)}.`,
+    "Write natural, native-sounding subtitles for real-time viewing.",
+    "Keep the meaning and tone, but prefer concise spoken phrasing over literal wording.",
+    "Do not add explanations, quotes, notes, speaker labels, or extra context.",
+    "If the input is fragmentary or unfinished, translate only what is present and do not complete it.",
+    "If a proper noun is unclear, keep it phonetically rather than guessing.",
     "Return only the translated subtitle text.",
     "",
     text
@@ -543,6 +670,10 @@ function buildTranslationPrompt(sourceLang, targetLang, text) {
 }
 
 async function handleFatalError(error) {
+  debugLog("session:error", {
+    sessionId: session.sessionId,
+    message: error?.message || "音声処理でエラーが発生しました。"
+  });
   await notifyBackground({
     type: MESSAGE_TYPES.sessionError,
     error: error?.message || "音声処理でエラーが発生しました。"
@@ -555,6 +686,11 @@ async function stopSession() {
     return;
   }
 
+  debugLog("session:stop", {
+    sessionId: session.sessionId,
+    queueLength: session.translationQueue.length,
+    activeTranslations: session.activeTranslationCount
+  });
   session.isStopping = true;
 
   if (session.autoStopTimer) {
@@ -565,13 +701,14 @@ async function stopSession() {
     clearInterval(session.keepAliveTimer);
   }
 
-  if (session.translationFlushTimer) {
-    clearTimeout(session.translationFlushTimer);
-  }
+  clearSoftBoundaryTimer();
 
-  if (session.maxHoldFlushTimer) {
-    clearTimeout(session.maxHoldFlushTimer);
-  }
+  session.translationQueue.length = 0;
+  session.activeTranslationCount = 0;
+  session.isPumpingTranslationQueue = false;
+  session.completedTranslations.clear();
+  session.translationStreamingResults.clear();
+  clearAllStreamingPartialState();
 
   if (session.translationAbortControllers.size) {
     for (const controller of session.translationAbortControllers) {
@@ -606,87 +743,358 @@ async function stopSession() {
   session = createEmptySession();
 }
 
-function schedulePunctuationFlush() {
-  const profile = getSegmentationProfile(session.settings?.segmentationMode);
-  if (session.translationFlushTimer) {
-    clearTimeout(session.translationFlushTimer);
-  }
-
-  session.translationFlushTimer = setTimeout(() => {
-    void flushPendingTranscript("punctuation-debounce");
-  }, profile.debounceMs);
-  scheduleMaxHoldFlush();
+async function reschedulePendingTimers() {
+  clearSoftBoundaryTimer();
+  await evaluatePendingBoundaries("settings-updated");
 }
 
-function scheduleMaxHoldFlush() {
-  if (!session.pendingStartedAt) {
+function clearSoftBoundaryTimer() {
+  if (session.softBoundaryTimer) {
+    clearTimeout(session.softBoundaryTimer);
+    session.softBoundaryTimer = null;
+  }
+
+  session.softBoundaryCandidate = null;
+}
+
+function getPendingTokens(endIndexAbsolute = session.finalWordBuffer.length) {
+  return session.finalWordBuffer.slice(session.lastEmittedWordIndex, endIndexAbsolute);
+}
+
+function getPendingFinalizedText(endIndexAbsolute = session.finalWordBuffer.length) {
+  return buildTranscriptFromTokens(getPendingTokens(endIndexAbsolute), session.settings?.sourceLang);
+}
+
+async function publishPreviewTranscript() {
+  if (!session.settings?.showSourcePreview || session.isStopping) {
+    return;
+  }
+
+  await notifyBackground({
+    type: MESSAGE_TYPES.partialTranscript,
+    transcript: buildPreviewTranscript()
+  });
+}
+
+function buildPreviewTranscript() {
+  const finalizedText = getPendingFinalizedText();
+  const interimTail = trimKnownPrefix(session.latestInterimTail, finalizedText);
+  return mergePreviewSegments(finalizedText, interimTail, session.settings?.sourceLang);
+}
+
+function extractFinalTokensFromPayload(payload, transcript) {
+  const alternative = payload?.channel?.alternatives?.[0];
+  const words = Array.isArray(alternative?.words) ? alternative.words : [];
+  if (words.length > 0) {
+    return words
+      .map((word) => createSegmentToken(word))
+      .filter((token) => Boolean(token?.displayText));
+  }
+
+  const fallbackText = normalizeModelText(transcript);
+  if (!fallbackText) {
+    return [];
+  }
+
+  return [
+    {
+      baseText: fallbackText,
+      displayText: fallbackText,
+      startMs: toMilliseconds(payload?.start),
+      endMs: toMilliseconds((payload?.start || 0) + (payload?.duration || 0))
+    }
+  ];
+}
+
+function createSegmentToken(word) {
+  const baseText = normalizeTokenText(word?.word);
+  const displayText = normalizeTokenText(word?.punctuated_word || word?.word);
+  if (!displayText) {
+    return null;
+  }
+
+  return {
+    baseText: baseText || displayText,
+    displayText,
+    startMs: toMilliseconds(word?.start),
+    endMs: toMilliseconds(word?.end)
+  };
+}
+
+function appendFinalWordTokens(tokens) {
+  if (!tokens.length) {
+    return 0;
+  }
+
+  const overlap = findTokenOverlap(session.finalWordBuffer, tokens);
+  if (overlap > 0) {
+    const overlapStartIndex = session.finalWordBuffer.length - overlap;
+    for (let index = 0; index < overlap; index += 1) {
+      session.finalWordBuffer[overlapStartIndex + index] = tokens[index];
+    }
+  }
+
+  const appendedTokens = tokens.slice(overlap);
+  if (!appendedTokens.length) {
+    return 0;
+  }
+
+  session.finalWordBuffer.push(...appendedTokens);
+  return appendedTokens.length;
+}
+
+function findTokenOverlap(existingTokens, incomingTokens) {
+  if (!existingTokens.length || !incomingTokens.length) {
+    return 0;
+  }
+
+  const maxOverlap = Math.min(existingTokens.length, incomingTokens.length);
+  for (let size = maxOverlap; size > 0; size -= 1) {
+    let matches = true;
+
+    for (let index = 0; index < size; index += 1) {
+      const existingToken = existingTokens[existingTokens.length - size + index];
+      const incomingToken = incomingTokens[index];
+      if (!tokensApproximatelyMatch(existingToken, incomingToken)) {
+        matches = false;
+        break;
+      }
+    }
+
+    if (matches) {
+      return size;
+    }
+  }
+
+  return 0;
+}
+
+function tokensApproximatelyMatch(leftToken, rightToken) {
+  if (!leftToken || !rightToken) {
+    return false;
+  }
+
+  return (
+    normalizeTokenIdentity(leftToken.baseText) === normalizeTokenIdentity(rightToken.baseText) &&
+    Math.abs((leftToken.startMs || 0) - (rightToken.startMs || 0)) <= TOKEN_TIME_TOLERANCE_MS &&
+    Math.abs((leftToken.endMs || 0) - (rightToken.endMs || 0)) <= TOKEN_TIME_TOLERANCE_MS
+  );
+}
+
+async function evaluatePendingBoundaries(trigger, { forceReason = null, utteranceEndMs = null } = {}) {
+  if (session.isStopping) {
     return;
   }
 
   const profile = getSegmentationProfile(session.settings?.segmentationMode);
-  const elapsed = Date.now() - session.pendingStartedAt;
-  const remaining = Math.max(0, profile.maxHoldMs - elapsed);
 
-  if (session.maxHoldFlushTimer) {
-    clearTimeout(session.maxHoldFlushTimer);
+  while (!session.isStopping) {
+    const pendingTokens = getPendingTokens();
+    if (!pendingTokens.length) {
+      clearSoftBoundaryTimer();
+      await publishPreviewTranscript();
+      return;
+    }
+
+    if (forceReason) {
+      const forcedEndIndex =
+        forceReason === "utterance-end" && Number.isFinite(utteranceEndMs)
+          ? findUtteranceEndBoundaryIndex(utteranceEndMs) || session.finalWordBuffer.length
+          : session.finalWordBuffer.length;
+      await flushPendingTokens(forceReason, {
+        endIndexAbsolute: forcedEndIndex
+      });
+      forceReason = null;
+      utteranceEndMs = null;
+      continue;
+    }
+
+    const hardBoundary = findHardBoundaryCandidate(pendingTokens);
+    if (hardBoundary) {
+      debugBoundaryEvent("boundary:detected", hardBoundary);
+      await flushPendingTokens(hardBoundary.reason, hardBoundary);
+      continue;
+    }
+
+    const watchdogBoundary = findWatchdogBoundaryCandidate(pendingTokens, profile);
+    if (watchdogBoundary) {
+      debugBoundaryEvent("boundary:detected", watchdogBoundary);
+      await flushPendingTokens(watchdogBoundary.reason, watchdogBoundary);
+      continue;
+    }
+
+    const softBoundary = findSoftBoundaryCandidate(pendingTokens, profile);
+    if (softBoundary) {
+      scheduleSoftBoundaryFlush(softBoundary, profile.softLookaheadMs);
+    } else {
+      clearSoftBoundaryTimer();
+    }
+
+    await publishPreviewTranscript();
+    debugLog("boundary:idle", {
+      sessionId: session.sessionId,
+      trigger,
+      pendingWords: pendingTokens.length
+    });
+    return;
   }
-
-  session.maxHoldFlushTimer = setTimeout(() => {
-    void flushPendingTranscript("max-hold");
-  }, remaining);
 }
 
-function reschedulePendingTimers() {
-  if (!session.pendingTranscriptText.trim()) {
+function findHardBoundaryCandidate(pendingTokens) {
+  for (let index = 0; index < pendingTokens.length; index += 1) {
+    if (HARD_BOUNDARY_PUNCTUATION_RE.test(getTokenRenderText(pendingTokens[index]))) {
+      return createBoundaryCandidate("punctuation", session.lastEmittedWordIndex + index + 1);
+    }
+  }
+
+  return null;
+}
+
+function findSoftBoundaryCandidate(pendingTokens, profile) {
+  let candidate = null;
+
+  for (let index = 0; index < pendingTokens.length; index += 1) {
+    const leftWordCount = index + 1;
+    if (leftWordCount < profile.minWords) {
+      continue;
+    }
+
+    const token = pendingTokens[index];
+    const absoluteEndIndex = session.lastEmittedWordIndex + leftWordCount;
+    if (SOFT_BOUNDARY_PUNCTUATION_RE.test(getTokenRenderText(token)) && !shouldSuppressSoftBoundary(token)) {
+      candidate = createBoundaryCandidate("punctuation", absoluteEndIndex);
+    }
+
+    const nextToken = pendingTokens[index + 1];
+    if (!nextToken || shouldSuppressSoftBoundary(token)) {
+      continue;
+    }
+
+    const gapMs = Math.max(0, (nextToken.startMs || 0) - (token.endMs || 0));
+    if (gapMs >= profile.wordGapMs) {
+      candidate = createBoundaryCandidate("word-gap", absoluteEndIndex, {
+        gapMs
+      });
+    }
+  }
+
+  return candidate;
+}
+
+function findWatchdogBoundaryCandidate(pendingTokens, profile) {
+  const { wordCount, durationMs } = measureTokenSpan(pendingTokens);
+  if (wordCount < profile.maxWords && durationMs < profile.maxDurationMs) {
+    return null;
+  }
+
+  const softCandidate = findSoftBoundaryCandidate(pendingTokens, profile);
+  if (softCandidate) {
+    return {
+      ...softCandidate,
+      reason: "watchdog"
+    };
+  }
+
+  return createBoundaryCandidate("watchdog", session.finalWordBuffer.length);
+}
+
+function createBoundaryCandidate(reason, endIndexAbsolute, extra = {}) {
+  const tokens = session.finalWordBuffer.slice(session.lastEmittedWordIndex, endIndexAbsolute);
+  const { wordCount, durationMs } = measureTokenSpan(tokens);
+
+  return {
+    reason,
+    endIndexAbsolute,
+    wordCount,
+    durationMs,
+    gapMs: extra.gapMs ?? null
+  };
+}
+
+function scheduleSoftBoundaryFlush(candidate, waitMs) {
+  const currentCandidate = session.softBoundaryCandidate;
+  if (
+    currentCandidate &&
+    currentCandidate.endIndexAbsolute === candidate.endIndexAbsolute &&
+    currentCandidate.reason === candidate.reason &&
+    currentCandidate.gapMs === candidate.gapMs
+  ) {
     return;
   }
 
-  if (endsWithSentenceBoundary(session.pendingTranscriptText)) {
-    schedulePunctuationFlush();
+  clearSoftBoundaryTimer();
+  session.softBoundaryCandidate = candidate;
+  debugBoundaryEvent("boundary:detected", candidate);
+  debugLog("boundary:deferred", {
+    sessionId: session.sessionId,
+    reason: candidate.reason,
+    wordCount: candidate.wordCount,
+    durationMs: candidate.durationMs,
+    gapMs: candidate.gapMs,
+    waitMs
+  });
+  session.softBoundaryTimer = setTimeout(() => {
+    void flushDeferredSoftBoundary(candidate);
+  }, waitMs);
+}
+
+async function flushDeferredSoftBoundary(candidate) {
+  if (
+    session.isStopping ||
+    !session.softBoundaryCandidate ||
+    session.softBoundaryCandidate.endIndexAbsolute !== candidate.endIndexAbsolute
+  ) {
     return;
   }
 
-  maybeFlushFromLocalSilence();
-  scheduleMaxHoldFlush();
+  clearSoftBoundaryTimer();
+  await flushPendingTokens(candidate.reason, candidate);
+  await evaluatePendingBoundaries("soft-boundary-flush");
 }
 
-function maybeFlushFromLocalSilence() {
-  const text = session.pendingTranscriptText.trim();
+function findUtteranceEndBoundaryIndex(lastWordEndMs) {
+  let boundaryIndex = null;
+
+  for (let index = session.lastEmittedWordIndex; index < session.finalWordBuffer.length; index += 1) {
+    const token = session.finalWordBuffer[index];
+    if ((token.endMs || 0) <= lastWordEndMs + TOKEN_TIME_TOLERANCE_MS) {
+      boundaryIndex = index + 1;
+      continue;
+    }
+
+    if ((token.startMs || 0) > lastWordEndMs + TOKEN_TIME_TOLERANCE_MS) {
+      break;
+    }
+  }
+
+  return boundaryIndex;
+}
+
+async function flushPendingTokens(reason, { endIndexAbsolute = session.finalWordBuffer.length, gapMs = null } = {}) {
+  const safeEndIndex = Math.max(session.lastEmittedWordIndex, Math.min(endIndexAbsolute, session.finalWordBuffer.length));
+  const tokens = session.finalWordBuffer.slice(session.lastEmittedWordIndex, safeEndIndex);
+  const text = buildTranscriptFromTokens(tokens, session.settings?.sourceLang);
   if (!text) {
     return;
   }
 
-  const profile = getSegmentationProfile(session.settings?.segmentationMode);
-  if (text.length < profile.minChars) {
-    return;
-  }
-
-  if (session.currentSilentForMs < profile.localSilenceMs) {
-    return;
-  }
-
-  void flushPendingTranscript("local-silence");
-}
-
-async function flushPendingTranscript() {
-  const text = session.pendingTranscriptText.trim();
-  if (!text) {
-    return;
-  }
-
-  if (session.translationFlushTimer) {
-    clearTimeout(session.translationFlushTimer);
-    session.translationFlushTimer = null;
-  }
-
-  if (session.maxHoldFlushTimer) {
-    clearTimeout(session.maxHoldFlushTimer);
-    session.maxHoldFlushTimer = null;
-  }
+  clearSoftBoundaryTimer();
 
   const sequenceId = ++session.sequenceId;
-  session.pendingTranscriptText = "";
-  session.pendingStartedAt = 0;
+  const { wordCount, durationMs } = measureTokenSpan(tokens);
+  debugLog("boundary:flush", {
+    sessionId: session.sessionId,
+    sequenceId,
+    reason,
+    wordCount,
+    durationMs,
+    gapMs,
+    queueLength: session.translationQueue.length,
+    activeTranslations: session.activeTranslationCount
+  });
+
+  session.lastEmittedWordIndex = safeEndIndex;
+  compactFinalWordBuffer();
 
   await notifyBackground({
     type: MESSAGE_TYPES.finalTranscript,
@@ -694,46 +1102,298 @@ async function flushPendingTranscript() {
     sequenceId
   });
 
-  const abortController = new AbortController();
-  session.translationAbortControllers.add(abortController);
-  session.latestTranslationRequestId = sequenceId;
+  enqueueTranslationTask({
+    sequenceId,
+    text,
+    provider: session.settings.translationProvider,
+    model: getGeminiModel(session.settings),
+    sourceLang: session.settings.sourceLang,
+    targetLang: session.settings.targetLang,
+    apiKey: getTranslationApiKey(session.settings)
+  });
+}
+
+function enqueueTranslationTask(task) {
+  session.translationQueue.push(task);
+  debugLog("translation:enqueue", {
+    sessionId: session.sessionId,
+    sequenceId: task.sequenceId,
+    provider: task.provider,
+    model: task.provider === TRANSLATION_PROVIDERS.gemini ? task.model : null,
+    queueLength: session.translationQueue.length,
+    activeTranslations: session.activeTranslationCount
+  });
+  void pumpTranslationQueue(session.sessionId);
+}
+
+async function pumpTranslationQueue(sessionId) {
+  if (session.isPumpingTranslationQueue) {
+    return;
+  }
+
+  session.isPumpingTranslationQueue = true;
 
   try {
-    await translateWithGeminiBestEffort({
-      apiKey: session.settings.geminiApiKey,
-      sourceLang: session.settings.sourceLang,
-      targetLang: session.settings.targetLang,
-      text,
+    while (
+      session.sessionId === sessionId &&
+      !session.isStopping &&
+      session.activeTranslationCount < MAX_CONCURRENT_TRANSLATIONS &&
+      session.translationQueue.length > 0
+    ) {
+      const task = session.translationQueue.shift();
+      if (!task) {
+        continue;
+      }
+
+      session.activeTranslationCount += 1;
+      debugLog("translation:start", {
+        sessionId,
+        sequenceId: task.sequenceId,
+        provider: task.provider,
+        model: task.provider === TRANSLATION_PROVIDERS.gemini ? task.model : null,
+        queueLength: session.translationQueue.length,
+        activeTranslations: session.activeTranslationCount
+      });
+      void runTranslationTask(task, sessionId);
+    }
+  } finally {
+    if (session.sessionId === sessionId) {
+      session.isPumpingTranslationQueue = false;
+    }
+  }
+}
+
+async function runTranslationTask(task, sessionId) {
+  const abortController = new AbortController();
+  session.translationAbortControllers.add(abortController);
+
+  try {
+    await translateWithProviderBestEffort({
+      provider: task.provider,
+      apiKey: task.apiKey,
+      model: task.model,
+      sourceLang: task.sourceLang,
+      targetLang: task.targetLang,
+      text: task.text,
       signal: abortController.signal,
       onUpdate: async (translation, isFinal) => {
-        if (sequenceId !== session.latestTranslationRequestId) {
+        if (session.sessionId !== sessionId || session.isStopping) {
           return;
         }
 
-        await notifyBackground({
-          type: MESSAGE_TYPES.finalTranslation,
-          translation,
-          sourceText: text,
-          sequenceId,
-          isFinal
-        });
+        if (isFinal) {
+          clearStreamingPartialState(task.sequenceId);
+          session.completedTranslations.set(task.sequenceId, {
+            translation,
+            sourceText: task.text,
+            provider: task.provider
+          });
+          session.translationStreamingResults.delete(task.sequenceId);
+          debugLog("translation:completed", {
+            sessionId,
+            sequenceId: task.sequenceId,
+            provider: task.provider,
+            model: task.provider === TRANSLATION_PROVIDERS.gemini ? task.model : null,
+            waitingForDisplay: task.sequenceId !== session.nextDisplaySequenceId
+          });
+          await flushReadyTranslationResults(sessionId);
+          return;
+        }
+
+        await stageStreamingTranslationUpdate(task, translation, sessionId);
       }
     });
   } catch (error) {
-    if (error?.name === "AbortError") {
-      return;
+    if (error?.name !== "AbortError" && session.sessionId === sessionId && !session.isStopping) {
+      debugLog("translation:error", {
+        sessionId,
+        sequenceId: task.sequenceId,
+        provider: task.provider,
+        model: task.provider === TRANSLATION_PROVIDERS.gemini ? task.model : null,
+        message: error?.message || String(error)
+      });
+      session.completedTranslations.set(task.sequenceId, {
+        translation: TRANSLATION_UNAVAILABLE_TEXT,
+        sourceText: task.text,
+        provider: task.provider
+      });
+      clearStreamingPartialState(task.sequenceId);
+      session.translationStreamingResults.delete(task.sequenceId);
+      await flushReadyTranslationResults(sessionId);
     }
+  } finally {
+    session.translationAbortControllers.delete(abortController);
+
+    if (session.sessionId === sessionId) {
+      session.activeTranslationCount = Math.max(0, session.activeTranslationCount - 1);
+      debugLog("translation:slot-free", {
+        sessionId,
+        sequenceId: task.sequenceId,
+        provider: task.provider,
+        model: task.provider === TRANSLATION_PROVIDERS.gemini ? task.model : null,
+        queueLength: session.translationQueue.length,
+        activeTranslations: session.activeTranslationCount
+      });
+      void pumpTranslationQueue(sessionId);
+    }
+  }
+}
+
+async function flushReadyTranslationResults(sessionId) {
+  if (session.sessionId !== sessionId || session.isStopping) {
+    return;
+  }
+
+  while (session.completedTranslations.has(session.nextDisplaySequenceId)) {
+    const readyTranslation = session.completedTranslations.get(session.nextDisplaySequenceId);
+    session.completedTranslations.delete(session.nextDisplaySequenceId);
+    session.translationStreamingResults.delete(session.nextDisplaySequenceId);
+    session.streamingLoggedSequenceIds.delete(session.nextDisplaySequenceId);
+
+    debugLog("translation:emit-final", {
+      sessionId,
+      sequenceId: session.nextDisplaySequenceId,
+      provider: readyTranslation.provider
+    });
 
     await notifyBackground({
       type: MESSAGE_TYPES.finalTranslation,
-      translation: TRANSLATION_UNAVAILABLE_TEXT,
-      sourceText: text,
-      sequenceId,
+      translation: readyTranslation.translation,
+      sourceText: readyTranslation.sourceText,
+      sequenceId: session.nextDisplaySequenceId,
       isFinal: true
     });
-  } finally {
-    session.translationAbortControllers.delete(abortController);
+
+    session.nextDisplaySequenceId += 1;
   }
+
+  await flushCurrentStreamingTranslation(sessionId);
+}
+
+async function stageStreamingTranslationUpdate(task, translation, sessionId) {
+  if (session.sessionId !== sessionId || session.isStopping) {
+    return;
+  }
+
+  const normalized = normalizeModelText(translation);
+  if (!normalized) {
+    return;
+  }
+
+  const streamingState = getOrCreateStreamingPartialState(task.sequenceId);
+  streamingState.rawText = normalized;
+
+  const candidateText = selectStableStreamingText(streamingState.emittedText, normalized);
+  if (!candidateText || candidateText === streamingState.emittedText) {
+    return;
+  }
+
+  const now = Date.now();
+  const shouldEmitImmediately =
+    candidateText.length >= STREAMING_MIN_EMIT_CHARS &&
+    (now - streamingState.lastEmitAt >= STREAMING_UPDATE_DEBOUNCE_MS || HARD_BOUNDARY_PUNCTUATION_RE.test(candidateText));
+
+  if (shouldEmitImmediately) {
+    await emitStreamingTranslationUpdate(task, candidateText, sessionId);
+    return;
+  }
+
+  if (!streamingState.timerId) {
+    streamingState.timerId = setTimeout(() => {
+      void flushDeferredStreamingUpdate(task, sessionId);
+    }, STREAMING_UPDATE_DEBOUNCE_MS);
+  }
+}
+
+async function flushDeferredStreamingUpdate(task, sessionId) {
+  const streamingState = session.streamingPartialState.get(task.sequenceId);
+  if (!streamingState) {
+    return;
+  }
+
+  streamingState.timerId = null;
+
+  if (session.sessionId !== sessionId || session.isStopping) {
+    return;
+  }
+
+  const candidateText = selectStableStreamingText(streamingState.emittedText, streamingState.rawText);
+  if (!candidateText || candidateText === streamingState.emittedText) {
+    return;
+  }
+
+  await emitStreamingTranslationUpdate(task, candidateText, sessionId);
+}
+
+async function emitStreamingTranslationUpdate(task, translation, sessionId) {
+  if (session.sessionId !== sessionId || session.isStopping) {
+    return;
+  }
+
+  const streamingState = getOrCreateStreamingPartialState(task.sequenceId);
+  clearStreamingPartialTimer(streamingState);
+  streamingState.emittedText = translation;
+  streamingState.lastEmitAt = Date.now();
+
+  session.translationStreamingResults.set(task.sequenceId, {
+    translation,
+    sourceText: task.text,
+    provider: task.provider
+  });
+
+  if (!session.streamingLoggedSequenceIds.has(task.sequenceId)) {
+    session.streamingLoggedSequenceIds.add(task.sequenceId);
+    debugLog("translation:streaming", {
+      sessionId,
+      sequenceId: task.sequenceId,
+      provider: task.provider,
+      model: task.provider === TRANSLATION_PROVIDERS.gemini ? task.model : null,
+      displayingNow: task.sequenceId === session.nextDisplaySequenceId
+    });
+  }
+
+  if (task.sequenceId === session.nextDisplaySequenceId) {
+    await notifyBackground({
+      type: MESSAGE_TYPES.finalTranslation,
+      translation,
+      sourceText: task.text,
+      sequenceId: task.sequenceId,
+      isFinal: false
+    });
+  }
+}
+
+async function flushCurrentStreamingTranslation(sessionId) {
+  if (session.sessionId !== sessionId || session.isStopping) {
+    return;
+  }
+
+  const streamingTranslation = session.translationStreamingResults.get(session.nextDisplaySequenceId);
+  if (!streamingTranslation?.translation) {
+    if (session.completedTranslations.size > 0 || session.translationQueue.length > 0 || session.activeTranslationCount > 0) {
+      debugLog("translation:waiting-head", {
+        sessionId,
+        nextDisplaySequenceId: session.nextDisplaySequenceId,
+        queued: session.translationQueue.length,
+        activeTranslations: session.activeTranslationCount,
+        completedBuffered: session.completedTranslations.size
+      });
+    }
+    return;
+  }
+
+  debugLog("translation:emit-stream", {
+    sessionId,
+    sequenceId: session.nextDisplaySequenceId,
+    provider: streamingTranslation.provider
+  });
+  await notifyBackground({
+    type: MESSAGE_TYPES.finalTranslation,
+    translation: streamingTranslation.translation,
+    sourceText: streamingTranslation.sourceText,
+    sequenceId: session.nextDisplaySequenceId,
+    isFinal: false
+  });
 }
 
 function resetAutoStopTimer() {
@@ -742,6 +1402,9 @@ function resetAutoStopTimer() {
   }
 
   session.autoStopTimer = setTimeout(async () => {
+    debugLog("session:auto-stop", {
+      sessionId: session.sessionId
+    });
     await notifyBackground({
       type: MESSAGE_TYPES.sessionError,
       error: "5分以上発話を検知しなかったため停止しました。"
@@ -764,17 +1427,27 @@ function createEmptySession() {
     recorderNode: null,
     keepAliveTimer: null,
     autoStopTimer: null,
-    translationFlushTimer: null,
-    maxHoldFlushTimer: null,
-    latestTranslationRequestId: 0,
+    softBoundaryTimer: null,
+    softBoundaryCandidate: null,
     sequenceId: 0,
-    pendingTranscriptText: "",
-    pendingStartedAt: 0,
+    finalWordBuffer: [],
+    lastEmittedWordIndex: 0,
+    latestInterimTail: "",
+    translationQueue: [],
+    activeTranslationCount: 0,
+    isPumpingTranslationQueue: false,
     translationAbortControllers: new Set(),
+    completedTranslations: new Map(),
+    translationStreamingResults: new Map(),
+    streamingPartialState: new Map(),
+    nextDisplaySequenceId: 1,
+    lastInterimLogAt: 0,
+    streamingLoggedSequenceIds: new Set(),
     currentAudioLevel: 0,
     currentSilentForMs: 0,
     hasReceivedAudio: false,
-    isStopping: false
+    isStopping: false,
+    sessionId: nextSessionId++
   };
 }
 
@@ -825,8 +1498,148 @@ function normalizeModelText(text) {
     .trim();
 }
 
-function endsWithSentenceBoundary(text) {
-  return /[.!?。！？]$/.test(text.trim());
+function normalizeTokenText(text) {
+  return String(text || "").trim();
+}
+
+function normalizeTokenIdentity(text) {
+  return normalizeTokenText(text).toLowerCase();
+}
+
+function toMilliseconds(value) {
+  return Math.max(0, Math.round(Number(value || 0) * 1000));
+}
+
+function getTokenRenderText(token) {
+  return normalizeTokenText(token?.displayText || token?.baseText || "");
+}
+
+function buildTranscriptFromTokens(tokens, sourceLang) {
+  if (!tokens.length) {
+    return "";
+  }
+
+  if (SPACELESS_LANGUAGES.has(sourceLang)) {
+    return tokens.map((token) => getTokenRenderText(token)).join("").trim();
+  }
+
+  let transcript = "";
+  for (const token of tokens) {
+    const tokenText = getTokenRenderText(token);
+    if (!tokenText) {
+      continue;
+    }
+
+    if (!transcript) {
+      transcript = tokenText;
+      continue;
+    }
+
+    if (/^[)\]}%.,!?;:]/.test(tokenText) || /[([{'"“‘-]$/.test(transcript)) {
+      transcript += tokenText;
+      continue;
+    }
+
+    transcript += ` ${tokenText}`;
+  }
+
+  return transcript.trim();
+}
+
+function trimKnownPrefix(text, knownPrefix) {
+  const normalizedText = normalizeSpaces(text);
+  const normalizedPrefix = normalizeSpaces(knownPrefix);
+
+  if (!normalizedPrefix) {
+    return normalizedText;
+  }
+
+  if (!normalizedText || normalizedText === normalizedPrefix) {
+    return "";
+  }
+
+  if (normalizedText.startsWith(normalizedPrefix)) {
+    return normalizeSpaces(normalizedText.slice(normalizedPrefix.length));
+  }
+
+  const maxOverlap = Math.min(normalizedPrefix.length, normalizedText.length);
+  for (let size = maxOverlap; size > 0; size -= 1) {
+    if (normalizedPrefix.slice(-size) === normalizedText.slice(0, size)) {
+      return normalizeSpaces(normalizedText.slice(size));
+    }
+  }
+
+  return normalizedText;
+}
+
+function mergePreviewSegments(finalizedText, interimTail, sourceLang) {
+  const base = normalizeModelText(finalizedText);
+  const tail = normalizeModelText(interimTail);
+  if (!base) {
+    return tail;
+  }
+
+  if (!tail) {
+    return base;
+  }
+
+  if (SPACELESS_LANGUAGES.has(sourceLang)) {
+    return `${base}${tail}`.trim();
+  }
+
+  return mergeTranscriptBuffer(base, tail);
+}
+
+function shouldSuppressSoftBoundary(token) {
+  if (session.settings?.sourceLang !== "en") {
+    return false;
+  }
+
+  const normalizedWord = normalizeTokenIdentity(token?.baseText).replace(/^[^a-z]+|[^a-z]+$/g, "");
+  return ENGLISH_SOFT_BOUNDARY_CONTINUERS.has(normalizedWord);
+}
+
+function measureTokenSpan(tokens) {
+  if (!tokens.length) {
+    return {
+      wordCount: 0,
+      durationMs: 0
+    };
+  }
+
+  const startMs = tokens[0]?.startMs || 0;
+  const endMs = tokens[tokens.length - 1]?.endMs || startMs;
+  return {
+    wordCount: tokens.length,
+    durationMs: Math.max(0, endMs - startMs)
+  };
+}
+
+function compactFinalWordBuffer() {
+  const emittedCount = session.lastEmittedWordIndex;
+  if (emittedCount < BUFFER_COMPACT_THRESHOLD) {
+    return;
+  }
+
+  session.finalWordBuffer.splice(0, emittedCount);
+  session.lastEmittedWordIndex = 0;
+
+  if (session.softBoundaryCandidate) {
+    session.softBoundaryCandidate = {
+      ...session.softBoundaryCandidate,
+      endIndexAbsolute: Math.max(0, session.softBoundaryCandidate.endIndexAbsolute - emittedCount)
+    };
+  }
+}
+
+function debugBoundaryEvent(event, candidate) {
+  debugLog(event, {
+    sessionId: session.sessionId,
+    reason: candidate.reason,
+    wordCount: candidate.wordCount,
+    durationMs: candidate.durationMs,
+    gapMs: candidate.gapMs
+  });
 }
 
 function mapDeepgramLanguage(language) {
@@ -849,6 +1662,117 @@ function labelForLanguage(language) {
   return mapping[language] || language;
 }
 
+function mapTranslationLanguage(provider, language) {
+  if (provider === TRANSLATION_PROVIDERS.cloudTranslation) {
+    const mapping = {
+      en: "en",
+      ja: "ja",
+      zh: "zh-CN"
+    };
+
+    return mapping[language] || language;
+  }
+
+  return language;
+}
+
+function getTranslationApiKey(settings) {
+  if (settings.translationProvider === TRANSLATION_PROVIDERS.cloudTranslation) {
+    return settings.cloudTranslationApiKey;
+  }
+
+  return settings.geminiApiKey;
+}
+
+function getGeminiModel(settings) {
+  return settings?.geminiModel || DEFAULT_SETTINGS.geminiModel;
+}
+
+function decodeHtmlEntities(text) {
+  htmlEntityDecoder.innerHTML = String(text || "");
+  return htmlEntityDecoder.value;
+}
+
+function getOrCreateStreamingPartialState(sequenceId) {
+  let streamingState = session.streamingPartialState.get(sequenceId);
+  if (!streamingState) {
+    streamingState = {
+      rawText: "",
+      emittedText: "",
+      lastEmitAt: 0,
+      timerId: null
+    };
+    session.streamingPartialState.set(sequenceId, streamingState);
+  }
+
+  return streamingState;
+}
+
+function clearStreamingPartialTimer(streamingState) {
+  if (streamingState?.timerId) {
+    clearTimeout(streamingState.timerId);
+    streamingState.timerId = null;
+  }
+}
+
+function clearStreamingPartialState(sequenceId) {
+  const streamingState = session.streamingPartialState.get(sequenceId);
+  if (!streamingState) {
+    return;
+  }
+
+  clearStreamingPartialTimer(streamingState);
+  session.streamingPartialState.delete(sequenceId);
+}
+
+function clearAllStreamingPartialState() {
+  for (const streamingState of session.streamingPartialState.values()) {
+    clearStreamingPartialTimer(streamingState);
+  }
+
+  session.streamingPartialState.clear();
+}
+
+function selectStableStreamingText(previousText, nextText) {
+  const previous = normalizeModelText(previousText);
+  const next = normalizeModelText(nextText);
+
+  if (!next) {
+    return "";
+  }
+
+  if (!previous) {
+    return next;
+  }
+
+  if (next.startsWith(previous)) {
+    return next;
+  }
+
+  if (previous.startsWith(next)) {
+    return "";
+  }
+
+  const sharedPrefixLength = getSharedPrefixLength(previous, next);
+  const similarityRatio = sharedPrefixLength / Math.max(previous.length, 1);
+  if (similarityRatio >= 0.75 && next.length >= previous.length) {
+    return next;
+  }
+
+  return "";
+}
+
+function getSharedPrefixLength(leftText, rightText) {
+  const maxLength = Math.min(leftText.length, rightText.length);
+  let index = 0;
+
+  while (index < maxLength && leftText[index] === rightText[index]) {
+    index += 1;
+  }
+
+  return index;
+}
+
 async function notifyBackground(message) {
   try {
     await chrome.runtime.sendMessage({
@@ -858,4 +1782,23 @@ async function notifyBackground(message) {
   } catch {
     // service worker may be waking up
   }
+}
+
+function maybeLogInterimProgress() {
+  const now = Date.now();
+  if (now - session.lastInterimLogAt < 1500) {
+    return;
+  }
+
+  session.lastInterimLogAt = now;
+  debugLog("deepgram:interim", {
+    sessionId: session.sessionId,
+    liveChars: session.latestInterimTail.length,
+    pendingWords: getPendingTokens().length,
+    silentForMs: session.currentSilentForMs
+  });
+}
+
+function debugLog(event, details = {}) {
+  console.info(DEBUG_LOG_PREFIX, event, details);
 }

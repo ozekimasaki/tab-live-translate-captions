@@ -204,6 +204,15 @@ select {
   font-weight: 700;
 }
 
+.provider-field {
+  display: none;
+}
+
+.app[data-provider="cloud-translation"] .provider-field[data-provider-field="cloud-translation"],
+.app[data-provider="gemini"] .provider-field[data-provider-field="gemini"] {
+  display: grid;
+}
+
 .field-wide {
   grid-column: 1 / -1;
 }
