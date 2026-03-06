@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Deepfram</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="app">
+      <header class="hero">
+        <p class="eyebrow">Deepgram + Gemini</p>
+        <h1>Realtime Translate Caption</h1>
+        <p class="lede">現在のタブ音声を文字起こしし、翻訳字幕をオーバーレイ表示します。</p>
+      </header>
+
+      <section class="panel">
+        <label class="field">
+          <span>Deepgram API Key</span>
+          <input id="deepgramApiKey" type="password" placeholder="dg_key..." autocomplete="off">
+        </label>
+        <label class="field">
+          <span>Gemini API Key</span>
+          <input id="geminiApiKey" type="password" placeholder="AIza..." autocomplete="off">
+        </label>
+      </section>
+
+      <section class="panel grid-two">
+        <label class="field">
+          <span>Source</span>
+          <select id="sourceLang"></select>
+        </label>
+        <label class="field">
+          <span>Target</span>
+          <select id="targetLang"></select>
+        </label>
+        <label class="field">
+          <span>Display Mode</span>
+          <select id="displayMode"></select>
+        </label>
+        <label class="field">
+          <span>Segmentation</span>
+          <select id="segmentationMode"></select>
+        </label>
+        <label class="field checkbox">
+          <input id="showSourcePreview" type="checkbox">
+          <span>原文プレビューを表示</span>
+        </label>
+      </section>
+
+      <section class="panel">
+        <label class="field">
+          <span>Overlay Opacity</span>
+          <input id="overlayOpacity" type="range" min="0.1" max="1" step="0.05">
+          <strong id="overlayOpacityValue">0.78</strong>
+        </label>
+      </section>
+
+      <section class="panel actions">
+        <button id="startButton" class="primary" type="button">開始</button>
+        <button id="stopButton" class="secondary" type="button">停止</button>
+      </section>
+
+      <section class="panel status">
+        <p id="statusText">停止中</p>
+        <p id="hintText">制限ページでは開始できません。</p>
+      </section>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

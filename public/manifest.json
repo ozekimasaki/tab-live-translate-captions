@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "Deepfram Live Translate Caption",
+  "description": "Realtime translated caption overlay for any page using Deepgram and Gemini.",
+  "version": "0.1.0",
+  "permissions": [
+    "activeTab",
+    "offscreen",
+    "scripting",
+    "storage",
+    "tabCapture"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "https://api.deepgram.com/*",
+    "https://generativelanguage.googleapis.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Deepfram",
+    "default_popup": "popup.html"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "audio-worklet.js",
+        "content.css",
+        "content.js"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
+}

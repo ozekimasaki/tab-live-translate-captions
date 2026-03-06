@@ -1,0 +1,133 @@
+:root {
+  color-scheme: dark;
+  --bg: #10181c;
+  --panel: rgba(20, 29, 34, 0.88);
+  --panel-border: rgba(166, 201, 192, 0.16);
+  --text: #ebf2ee;
+  --muted: #9ab4a9;
+  --accent: #79e1ba;
+  --accent-strong: #57c49d;
+  --danger: #ff8c8c;
+  --shadow: 0 16px 36px rgba(0, 0, 0, 0.32);
+  font-family: "Segoe UI", "Yu Gothic UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 360px;
+  background:
+    radial-gradient(circle at top right, rgba(121, 225, 186, 0.18), transparent 42%),
+    linear-gradient(160deg, #111a1e, #0a1013 72%);
+  color: var(--text);
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+}
+
+.hero h1 {
+  margin: 4px 0 8px;
+  font-size: 1.15rem;
+  line-height: 1.2;
+}
+
+.eyebrow {
+  margin: 0;
+  color: var(--accent);
+  font-size: 0.74rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.lede {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.84rem;
+  line-height: 1.4;
+}
+
+.panel {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--panel-border);
+  border-radius: 16px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+
+.grid-two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.field {
+  display: grid;
+  gap: 6px;
+  font-size: 0.8rem;
+}
+
+.field input,
+.field select,
+.actions button {
+  width: 100%;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: rgba(6, 10, 12, 0.72);
+  color: var(--text);
+}
+
+.checkbox {
+  grid-template-columns: auto 1fr;
+  align-items: center;
+}
+
+.checkbox input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+}
+
+.actions {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.actions button {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.actions .primary {
+  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+  color: #072018;
+}
+
+.actions .secondary {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.actions button:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+}
+
+.status p {
+  margin: 0;
+}
+
+#statusText {
+  font-weight: 700;
+}
+
+#hintText {
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}

@@ -1,0 +1,91 @@
+#deepfram-overlay {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  z-index: 2147483647;
+  width: min(78vw, 860px);
+  padding: 0;
+  transform: translateX(-50%);
+  font-family: "Segoe UI", "Yu Gothic UI", sans-serif;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 180ms ease;
+}
+
+#deepfram-overlay.deepfram-visible {
+  opacity: 1;
+}
+
+#deepfram-overlay .deepfram-shell {
+  display: grid;
+  gap: 10px;
+  border-radius: 22px;
+  padding: 14px 16px 16px;
+  background: rgba(9, 13, 16, 0.78);
+  backdrop-filter: blur(18px);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.38);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  pointer-events: auto;
+}
+
+#deepfram-overlay .deepfram-drag {
+  width: 72px;
+  height: 6px;
+  margin: 0 auto;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.24);
+  cursor: grab;
+}
+
+#deepfram-overlay .deepfram-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: rgba(238, 244, 242, 0.72);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+#deepfram-overlay .deepfram-preview,
+#deepfram-overlay .deepfram-source {
+  margin: 0;
+  color: rgba(233, 241, 236, 0.88);
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+#deepfram-overlay .deepfram-preview {
+  color: rgba(121, 225, 186, 0.88);
+  font-style: italic;
+}
+
+#deepfram-overlay .deepfram-translation {
+  margin: 0;
+  color: #f7fbfa;
+  font-size: clamp(20px, 2vw, 28px);
+  font-weight: 700;
+  line-height: 1.45;
+  text-shadow: 0 2px 10px rgba(0, 0, 0, 0.28);
+}
+
+#deepfram-overlay .deepfram-error {
+  margin: 0;
+  color: #ffb4b4;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+#deepfram-overlay[data-display-mode="translation-only"] .deepfram-source,
+#deepfram-overlay[data-display-mode="translation-only"] .deepfram-preview {
+  display: none;
+}
+
+#deepfram-overlay[data-display-mode="dual"] .deepfram-source {
+  display: block;
+}
+
+#deepfram-overlay[data-preview-visible="false"] .deepfram-preview {
+  display: none;
+}
