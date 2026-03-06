@@ -1,17 +1,27 @@
 import {
   DEFAULT_SETTINGS,
-  DISPLAY_MODES,
   MESSAGE_TYPES,
   PRESET_LANGUAGE_PAIRS,
-  SEGMENTATION_MODES,
   SESSION_STATUS
 } from "./constants.js";
+import {
+  DISPLAY_MODE_OPTIONS,
+  SEGMENTATION_MODE_OPTIONS,
+  buildLanguagePairValue,
+  getActiveTabSummary,
+  getPopupStatusModel,
+  parseLanguagePairValue
+} from "./ui-copy.js";
 
 const elements = {
+  statusCard: document.querySelector("#statusCard"),
+  statusBadge: document.querySelector("#statusBadge"),
+  statusPair: document.querySelector("#statusPair"),
+  tabTitle: document.querySelector("#tabTitle"),
+  tabMeta: document.querySelector("#tabMeta"),
   deepgramApiKey: document.querySelector("#deepgramApiKey"),
   geminiApiKey: document.querySelector("#geminiApiKey"),
-  sourceLang: document.querySelector("#sourceLang"),
-  targetLang: document.querySelector("#targetLang"),
+  languagePair: document.querySelector("#languagePair"),
   displayMode: document.querySelector("#displayMode"),
   segmentationMode: document.querySelector("#segmentationMode"),
   showSourcePreview: document.querySelector("#showSourcePreview"),
@@ -42,20 +52,19 @@ initialize().catch((error) => {
 });
 
 async function initialize() {
-  populateDisplayModeOptions();
-  populateSegmentationModeOptions();
-  populateSourceOptions();
+  populateLanguagePairOptions();
+  populateOptions(elements.displayMode, DISPLAY_MODE_OPTIONS);
+  populateOptions(elements.segmentationMode, SEGMENTATION_MODE_OPTIONS);
+  bindEvents();
+  await refreshState();
+}
 
+function bindEvents() {
   elements.overlayOpacity.addEventListener("input", () => {
     elements.overlayOpacityValue.textContent = Number(elements.overlayOpacity.value).toFixed(2);
   });
 
-  elements.sourceLang.addEventListener("change", async () => {
-    populateTargetOptions(elements.sourceLang.value);
-    await persistDraftSettings();
-  });
-
-  elements.targetLang.addEventListener("change", persistDraftSettings);
+  elements.languagePair.addEventListener("change", persistDraftSettings);
   elements.displayMode.addEventListener("change", persistDraftSettings);
   elements.segmentationMode.addEventListener("change", persistDraftSettings);
   elements.showSourcePreview.addEventListener("change", persistDraftSettings);
@@ -74,9 +83,7 @@ async function initialize() {
       cachedState.sessionState = changes.sessionState.newValue;
       renderStatus();
     }
-  });
-
-  await refreshState();
+  });  
 }
 
 async function refreshState() {
@@ -104,92 +111,61 @@ async function refreshState() {
 function renderForm(settings) {
   elements.deepgramApiKey.value = settings.deepgramApiKey || "";
   elements.geminiApiKey.value = settings.geminiApiKey || "";
-  elements.sourceLang.value = settings.sourceLang;
-  populateTargetOptions(settings.sourceLang, settings.targetLang);
-  elements.displayMode.value = settings.displayMode || DISPLAY_MODES.translationOnly;
-  elements.segmentationMode.value = settings.segmentationMode || SEGMENTATION_MODES.balanced;
+  elements.languagePair.value = buildLanguagePairValue(settings.sourceLang, settings.targetLang);
+  elements.displayMode.value = settings.displayMode;
+  elements.segmentationMode.value = settings.segmentationMode;
   elements.showSourcePreview.checked = Boolean(settings.showSourcePreview);
   elements.overlayOpacity.value = String(settings.overlayOpacity ?? DEFAULT_SETTINGS.overlayOpacity);
   elements.overlayOpacityValue.textContent = Number(elements.overlayOpacity.value).toFixed(2);
 }
 
 function renderStatus() {
-  const { sessionState, support } = cachedState;
-  elements.statusText.textContent = sessionState.message || "停止中";
+  const viewModel = getPopupStatusModel(cachedState);
+  const tabSummary = getActiveTabSummary(cachedState.activeTab, cachedState.support);
 
-  if (!support.supported && sessionState.status !== SESSION_STATUS.active) {
-    elements.hintText.textContent = support.reason;
-  } else if (sessionState.status === SESSION_STATUS.active) {
-    elements.hintText.textContent = "現在のタブ音声を翻訳字幕として表示中です。";
-  } else if (sessionState.status === SESSION_STATUS.error) {
-    elements.hintText.textContent = "キー設定またはネットワーク接続を確認してください。";
-  } else {
-    elements.hintText.textContent = "開始すると現在のアクティブタブ音声を取得します。";
-  }
-
-  elements.startButton.disabled = !support.supported || sessionState.status === SESSION_STATUS.starting;
-  elements.stopButton.disabled = sessionState.status === SESSION_STATUS.idle;
+  elements.statusCard.dataset.state = viewModel.state;
+  elements.statusBadge.textContent = viewModel.badge;
+  elements.statusPair.textContent = viewModel.pairLabel;
+  elements.statusText.textContent = viewModel.title;
+  elements.hintText.textContent = viewModel.hint;
+  elements.tabTitle.textContent = tabSummary.title;
+  elements.tabMeta.textContent = tabSummary.meta;
+  elements.startButton.disabled =
+    !cachedState.support.supported || cachedState.sessionState.status === SESSION_STATUS.starting;
+  elements.stopButton.disabled = cachedState.sessionState.status === SESSION_STATUS.idle;
 }
 
-function populateDisplayModeOptions() {
-  const options = [
-    { value: DISPLAY_MODES.translationOnly, label: "翻訳のみ" },
-    { value: DISPLAY_MODES.dual, label: "原文 + 翻訳" }
-  ];
+function populateLanguagePairOptions() {
+  elements.languagePair.innerHTML = "";
 
-  elements.displayMode.innerHTML = "";
+  for (const pair of PRESET_LANGUAGE_PAIRS) {
+    const node = document.createElement("option");
+    node.value = buildLanguagePairValue(pair.sourceLang, pair.targetLang);
+    node.textContent = pair.label;
+    elements.languagePair.appendChild(node);
+  }
+}
+
+function populateOptions(selectElement, options) {
+  selectElement.innerHTML = "";
+
   for (const option of options) {
     const node = document.createElement("option");
     node.value = option.value;
     node.textContent = option.label;
-    elements.displayMode.appendChild(node);
+    selectElement.appendChild(node);
   }
-}
-
-function populateSegmentationModeOptions() {
-  const options = [
-    { value: SEGMENTATION_MODES.latency, label: "Low Latency" },
-    { value: SEGMENTATION_MODES.balanced, label: "Balanced" },
-    { value: SEGMENTATION_MODES.natural, label: "Natural" }
-  ];
-
-  elements.segmentationMode.innerHTML = "";
-  for (const option of options) {
-    const node = document.createElement("option");
-    node.value = option.value;
-    node.textContent = option.label;
-    elements.segmentationMode.appendChild(node);
-  }
-}
-
-function populateSourceOptions() {
-  const uniqueSources = Array.from(new Set(PRESET_LANGUAGE_PAIRS.map((pair) => pair.sourceLang)));
-  elements.sourceLang.innerHTML = "";
-
-  for (const sourceLang of uniqueSources) {
-    const node = document.createElement("option");
-    node.value = sourceLang;
-    node.textContent = labelForLanguage(sourceLang);
-    elements.sourceLang.appendChild(node);
-  }
-}
-
-function populateTargetOptions(sourceLang, targetLang) {
-  const pair = PRESET_LANGUAGE_PAIRS.find((item) => item.sourceLang === sourceLang) || PRESET_LANGUAGE_PAIRS[0];
-  elements.targetLang.innerHTML = "";
-
-  const node = document.createElement("option");
-  node.value = pair.targetLang;
-  node.textContent = labelForLanguage(pair.targetLang);
-  elements.targetLang.appendChild(node);
-  elements.targetLang.value = targetLang === pair.targetLang ? targetLang : pair.targetLang;
 }
 
 async function handleStart() {
   const settings = await persistDraftSettings();
   if (!cachedState.activeTab?.id) {
-    elements.statusText.textContent = "開始に失敗しました";
-    elements.hintText.textContent = "対象タブを取得できませんでした。";
+    cachedState.sessionState = {
+      ...cachedState.sessionState,
+      status: SESSION_STATUS.error,
+      message: "対象タブを取得できませんでした"
+    };
+    renderStatus();
     return;
   }
 
@@ -200,8 +176,12 @@ async function handleStart() {
   });
 
   if (!response?.ok) {
-    elements.statusText.textContent = "開始に失敗しました";
-    elements.hintText.textContent = response?.error || "開始処理でエラーが発生しました。";
+    cachedState.sessionState = {
+      ...cachedState.sessionState,
+      status: SESSION_STATUS.error,
+      message: response?.error || "開始処理でエラーが発生しました。"
+    };
+    renderStatus();
     return;
   }
 
@@ -214,8 +194,12 @@ async function handleStop() {
   });
 
   if (!response?.ok) {
-    elements.statusText.textContent = "停止に失敗しました";
-    elements.hintText.textContent = response?.error || "停止処理でエラーが発生しました。";
+    cachedState.sessionState = {
+      ...cachedState.sessionState,
+      status: SESSION_STATUS.error,
+      message: response?.error || "停止処理でエラーが発生しました。"
+    };
+    renderStatus();
     return;
   }
 
@@ -223,11 +207,12 @@ async function handleStop() {
 }
 
 async function persistDraftSettings() {
+  const selectedPair = parseLanguagePairValue(elements.languagePair.value);
   const settings = {
     deepgramApiKey: elements.deepgramApiKey.value.trim(),
     geminiApiKey: elements.geminiApiKey.value.trim(),
-    sourceLang: elements.sourceLang.value,
-    targetLang: elements.targetLang.value,
+    sourceLang: selectedPair.sourceLang,
+    targetLang: selectedPair.targetLang,
     displayMode: elements.displayMode.value,
     segmentationMode: elements.segmentationMode.value,
     showSourcePreview: elements.showSourcePreview.checked,
@@ -243,17 +228,8 @@ async function persistDraftSettings() {
   if (response?.ok && response.settings) {
     cachedState.settings = response.settings;
     renderForm(cachedState.settings);
+    renderStatus();
   }
 
   return cachedState.settings;
-}
-
-function labelForLanguage(lang) {
-  const mapping = {
-    en: "English",
-    ja: "日本語",
-    zh: "简体中文"
-  };
-
-  return mapping[lang] || lang.toUpperCase();
 }

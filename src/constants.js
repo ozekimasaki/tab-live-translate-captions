@@ -15,15 +15,15 @@ export const SEGMENTATION_MODES = {
 };
 
 export const LANGUAGES = [
-  { label: "English", value: "en" },
+  { label: "英語", value: "en" },
   { label: "日本語", value: "ja" },
-  { label: "简体中文", value: "zh" }
+  { label: "中国語", value: "zh" }
 ];
 
 export const PRESET_LANGUAGE_PAIRS = [
-  { sourceLang: "en", targetLang: "ja", label: "English -> 日本語" },
-  { sourceLang: "zh", targetLang: "ja", label: "中文 -> 日本語" },
-  { sourceLang: "ja", targetLang: "en", label: "日本語 -> English" }
+  { sourceLang: "en", targetLang: "ja", label: "英語 → 日本語" },
+  { sourceLang: "zh", targetLang: "ja", label: "中国語 → 日本語" },
+  { sourceLang: "ja", targetLang: "en", label: "日本語 → 英語" }
 ];
 
 export const DEFAULT_SETTINGS = {

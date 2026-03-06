@@ -21,9 +21,9 @@ npm run build
 
 1. 拡張 popup を開く
 2. `Deepgram API Key` と `Gemini API Key` を入力する
-3. 言語方向、表示モード、原文プレビュー、透過率を設定する
+3. `翻訳方向`、`表示モード`、`字幕の区切り`、`原文プレビュー`、`背景の濃さ` を設定する
 4. 字幕を出したいタブをアクティブにした状態で `開始` を押す
-5. オーバーレイのドラッグハンドルを使って位置を移動する
+5. ページ下部の字幕バーをドラッグして位置を移動する
 
 ## Current Constraints
 
@@ -39,4 +39,5 @@ npm run build
 - `src/offscreen.js`: タブ音声取得、Deepgram STT、Gemini 翻訳
 - `src/content.js`: 字幕オーバーレイ描画、ドラッグ移動
 - `src/popup.js`: 設定 UI
+- `src/ui-copy.js`: UI 文言、ラベル、状態表示の共通化
 - `src/audio-worklet.js`: PCM 変換

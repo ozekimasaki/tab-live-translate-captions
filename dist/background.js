@@ -14,9 +14,9 @@
     natural: "natural"
   };
   var PRESET_LANGUAGE_PAIRS = [
-    { sourceLang: "en", targetLang: "ja", label: "English -> \u65E5\u672C\u8A9E" },
-    { sourceLang: "zh", targetLang: "ja", label: "\u4E2D\u6587 -> \u65E5\u672C\u8A9E" },
-    { sourceLang: "ja", targetLang: "en", label: "\u65E5\u672C\u8A9E -> English" }
+    { sourceLang: "en", targetLang: "ja", label: "\u82F1\u8A9E \u2192 \u65E5\u672C\u8A9E" },
+    { sourceLang: "zh", targetLang: "ja", label: "\u4E2D\u56FD\u8A9E \u2192 \u65E5\u672C\u8A9E" },
+    { sourceLang: "ja", targetLang: "en", label: "\u65E5\u672C\u8A9E \u2192 \u82F1\u8A9E" }
   ];
   var DEFAULT_SETTINGS = {
     deepgramApiKey: "",
@@ -351,17 +351,6 @@
     };
   }
   async function ensureContentLayer(tabId) {
-    try {
-      const [result] = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: () => Boolean(window.__deepframContentLoaded)
-      });
-      if (result?.result) {
-        return;
-      }
-    } catch (error) {
-      throw new Error(error.message || "\u30DA\u30FC\u30B8\u306B\u30B9\u30AF\u30EA\u30D7\u30C8\u3092\u633F\u5165\u3067\u304D\u307E\u305B\u3093\u3067\u3057\u305F\u3002");
-    }
     await chrome.scripting.insertCSS({
       target: { tabId },
       files: ["content.css"]

@@ -3,13 +3,14 @@
   left: 50%;
   bottom: 28px;
   z-index: 2147483647;
-  width: min(78vw, 860px);
-  padding: 0;
+  width: min(74vw, 880px);
   transform: translateX(-50%);
-  font-family: "Segoe UI", "Yu Gothic UI", sans-serif;
+  font-family: "BIZ UDPGothic", "Hiragino Sans", "Yu Gothic UI", sans-serif;
   pointer-events: none;
   opacity: 0;
-  transition: opacity 180ms ease;
+  transition:
+    opacity 180ms ease,
+    transform 180ms ease;
 }
 
 #deepfram-overlay.deepfram-visible {
@@ -18,74 +19,157 @@
 
 #deepfram-overlay .deepfram-shell {
   display: grid;
-  gap: 10px;
-  border-radius: 22px;
+  gap: 12px;
   padding: 14px 16px 16px;
-  background: rgba(9, 13, 16, 0.78);
-  backdrop-filter: blur(18px);
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.38);
+  border-radius: 24px;
+  background: rgba(12, 16, 18, 0.78);
   border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 20px 56px rgba(0, 0, 0, 0.36);
+  backdrop-filter: blur(18px);
   pointer-events: auto;
 }
 
 #deepfram-overlay .deepfram-drag {
-  width: 72px;
+  width: 84px;
   height: 6px;
   margin: 0 auto;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.24);
+  background: rgba(255, 255, 255, 0.22);
   cursor: grab;
 }
 
-#deepfram-overlay .deepfram-meta {
+#deepfram-overlay .deepfram-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  color: rgba(238, 244, 242, 0.72);
+}
+
+#deepfram-overlay .deepfram-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  padding: 0 12px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(247, 251, 249, 0.92);
   font-size: 12px;
+  font-weight: 700;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
+}
+
+#deepfram-overlay .deepfram-chip-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgba(247, 251, 249, 0.7);
+}
+
+#deepfram-overlay[data-state="active"] .deepfram-chip {
+  background: rgba(109, 210, 165, 0.14);
+  color: #dffcf0;
+}
+
+#deepfram-overlay[data-state="active"] .deepfram-chip-dot {
+  background: #72dfb3;
+  box-shadow: 0 0 0 4px rgba(114, 223, 179, 0.14);
+}
+
+#deepfram-overlay[data-state="starting"] .deepfram-chip {
+  background: rgba(244, 206, 124, 0.15);
+  color: #ffe8b2;
+}
+
+#deepfram-overlay[data-state="starting"] .deepfram-chip-dot {
+  background: #f4ce7c;
+}
+
+#deepfram-overlay[data-state="error"] .deepfram-chip {
+  background: rgba(255, 140, 140, 0.14);
+  color: #ffd5d5;
+}
+
+#deepfram-overlay[data-state="error"] .deepfram-chip-dot {
+  background: #ff8c8c;
+}
+
+#deepfram-overlay .deepfram-pair {
+  color: rgba(237, 244, 241, 0.74);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+#deepfram-overlay .deepfram-block {
+  display: grid;
+  gap: 6px;
+}
+
+#deepfram-overlay .deepfram-label {
+  color: rgba(237, 244, 241, 0.54);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
 }
 
 #deepfram-overlay .deepfram-preview,
-#deepfram-overlay .deepfram-source {
+#deepfram-overlay .deepfram-source,
+#deepfram-overlay .deepfram-translation,
+#deepfram-overlay .deepfram-error {
   margin: 0;
-  color: rgba(233, 241, 236, 0.88);
-  font-size: 14px;
-  line-height: 1.4;
 }
 
 #deepfram-overlay .deepfram-preview {
-  color: rgba(121, 225, 186, 0.88);
-  font-style: italic;
+  color: rgba(167, 241, 210, 0.94);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+#deepfram-overlay .deepfram-source {
+  color: rgba(240, 245, 243, 0.84);
+  font-size: 15px;
+  line-height: 1.48;
 }
 
 #deepfram-overlay .deepfram-translation {
-  margin: 0;
-  color: #f7fbfa;
+  color: #fbfdfc;
   font-size: clamp(20px, 2vw, 28px);
   font-weight: 700;
-  line-height: 1.45;
-  text-shadow: 0 2px 10px rgba(0, 0, 0, 0.28);
+  line-height: 1.48;
+  text-shadow: 0 2px 10px rgba(0, 0, 0, 0.26);
 }
 
 #deepfram-overlay .deepfram-error {
-  margin: 0;
-  color: #ffb4b4;
+  color: #ffbaba;
   font-size: 13px;
-  line-height: 1.4;
+  line-height: 1.45;
 }
 
-#deepfram-overlay[data-display-mode="translation-only"] .deepfram-source,
-#deepfram-overlay[data-display-mode="translation-only"] .deepfram-preview {
+#deepfram-overlay[data-display-mode="translation-only"] .deepfram-block-source,
+#deepfram-overlay[data-preview-visible="false"] .deepfram-block-preview,
+#deepfram-overlay[data-has-preview="false"] .deepfram-block-preview,
+#deepfram-overlay[data-has-source="false"] .deepfram-block-source,
+#deepfram-overlay[data-has-error="false"] .deepfram-error {
   display: none;
 }
 
-#deepfram-overlay[data-display-mode="dual"] .deepfram-source {
-  display: block;
-}
+@media (max-width: 960px) {
+  #deepfram-overlay {
+    width: min(92vw, 880px);
+  }
 
-#deepfram-overlay[data-preview-visible="false"] .deepfram-preview {
-  display: none;
+  #deepfram-overlay .deepfram-shell {
+    gap: 10px;
+    padding: 12px 14px 14px;
+    border-radius: 20px;
+  }
+
+  #deepfram-overlay .deepfram-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  #deepfram-overlay .deepfram-translation {
+    font-size: clamp(18px, 4.8vw, 24px);
+  }
 }

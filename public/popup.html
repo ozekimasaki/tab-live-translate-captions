@@ -9,61 +9,98 @@
   <body>
     <main class="app">
       <header class="hero">
-        <p class="eyebrow">Deepgram + Gemini</p>
-        <h1>Realtime Translate Caption</h1>
-        <p class="lede">現在のタブ音声を文字起こしし、翻訳字幕をオーバーレイ表示します。</p>
+        <p class="eyebrow">Realtime Caption Overlay</p>
+        <h1>ライブ翻訳字幕</h1>
+        <p class="lede">現在のタブ音声を拾い、ページ下に翻訳字幕を重ねて表示します。</p>
       </header>
 
+      <section id="statusCard" class="status-card" data-state="idle">
+        <div class="status-top">
+          <span id="statusBadge" class="status-badge">待機中</span>
+          <span id="statusPair" class="status-pair">英語 → 日本語</span>
+        </div>
+        <p id="statusText" class="status-title">開始すると現在のタブ音声を取得します</p>
+        <p id="hintText" class="status-note">通常の Web ページで使えます。</p>
+        <div class="tab-summary">
+          <span class="tab-label">対象タブ</span>
+          <strong id="tabTitle">タブを確認中…</strong>
+          <span id="tabMeta" class="tab-meta">URL を取得中</span>
+        </div>
+      </section>
+
       <section class="panel">
+        <div class="section-head">
+          <div>
+            <p class="section-eyebrow">接続設定</p>
+            <h2>API キー</h2>
+          </div>
+          <p class="section-note">キーはこのブラウザに保存されます。</p>
+        </div>
+
         <label class="field">
           <span>Deepgram API Key</span>
           <input id="deepgramApiKey" type="password" placeholder="dg_key..." autocomplete="off">
         </label>
+
         <label class="field">
           <span>Gemini API Key</span>
           <input id="geminiApiKey" type="password" placeholder="AIza..." autocomplete="off">
         </label>
       </section>
 
-      <section class="panel grid-two">
-        <label class="field">
-          <span>Source</span>
-          <select id="sourceLang"></select>
-        </label>
-        <label class="field">
-          <span>Target</span>
-          <select id="targetLang"></select>
-        </label>
-        <label class="field">
-          <span>Display Mode</span>
-          <select id="displayMode"></select>
-        </label>
-        <label class="field">
-          <span>Segmentation</span>
-          <select id="segmentationMode"></select>
-        </label>
-        <label class="field checkbox">
+      <section class="panel">
+        <div class="section-head">
+          <div>
+            <p class="section-eyebrow">字幕設定</p>
+            <h2>表示と区切り</h2>
+          </div>
+          <p class="section-note">用途に合わせて読みやすさを調整します。</p>
+        </div>
+
+        <div class="grid-two">
+          <label class="field field-wide">
+            <span>翻訳方向</span>
+            <select id="languagePair"></select>
+          </label>
+
+          <label class="field">
+            <span>表示モード</span>
+            <select id="displayMode"></select>
+          </label>
+
+          <label class="field">
+            <span>字幕の区切り</span>
+            <select id="segmentationMode"></select>
+          </label>
+        </div>
+
+        <label class="field checkbox-row">
           <input id="showSourcePreview" type="checkbox">
-          <span>原文プレビューを表示</span>
+          <span>原文プレビューを表示する</span>
         </label>
       </section>
 
       <section class="panel">
+        <div class="section-head">
+          <div>
+            <p class="section-eyebrow">見た目</p>
+            <h2>オーバーレイ</h2>
+          </div>
+          <p class="section-note">背景の濃さだけを調整します。</p>
+        </div>
+
         <label class="field">
-          <span>Overlay Opacity</span>
-          <input id="overlayOpacity" type="range" min="0.1" max="1" step="0.05">
-          <strong id="overlayOpacityValue">0.78</strong>
+          <span>背景の濃さ</span>
+          <div class="range-row">
+            <input id="overlayOpacity" type="range" min="0.1" max="1" step="0.05">
+            <strong id="overlayOpacityValue" class="range-value">0.78</strong>
+          </div>
         </label>
       </section>
 
-      <section class="panel actions">
-        <button id="startButton" class="primary" type="button">開始</button>
+      <section class="actions">
+        <button id="startButton" class="primary" type="button">字幕を開始</button>
         <button id="stopButton" class="secondary" type="button">停止</button>
-      </section>
-
-      <section class="panel status">
-        <p id="statusText">停止中</p>
-        <p id="hintText">制限ページでは開始できません。</p>
       </section>
     </main>
 

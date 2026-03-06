@@ -573,8 +573,11 @@ async function stopSession() {
     clearTimeout(session.maxHoldFlushTimer);
   }
 
-  if (session.translationAbortController) {
-    session.translationAbortController.abort();
+  if (session.translationAbortControllers.size) {
+    for (const controller of session.translationAbortControllers) {
+      controller.abort();
+    }
+    session.translationAbortControllers.clear();
   }
 
   if (session.connection) {
@@ -691,12 +694,8 @@ async function flushPendingTranscript() {
     sequenceId
   });
 
-  if (session.translationAbortController) {
-    session.translationAbortController.abort();
-  }
-
   const abortController = new AbortController();
-  session.translationAbortController = abortController;
+  session.translationAbortControllers.add(abortController);
   session.latestTranslationRequestId = sequenceId;
 
   try {
@@ -733,9 +732,7 @@ async function flushPendingTranscript() {
       isFinal: true
     });
   } finally {
-    if (session.translationAbortController === abortController) {
-      session.translationAbortController = null;
-    }
+    session.translationAbortControllers.delete(abortController);
   }
 }
 
@@ -773,7 +770,7 @@ function createEmptySession() {
     sequenceId: 0,
     pendingTranscriptText: "",
     pendingStartedAt: 0,
-    translationAbortController: null,
+    translationAbortControllers: new Set(),
     currentAudioLevel: 0,
     currentSilentForMs: 0,
     hasReceivedAudio: false,

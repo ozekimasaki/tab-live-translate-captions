@@ -280,19 +280,6 @@ async function handleOffscreenEvent(message) {
 }
 
 async function ensureContentLayer(tabId) {
-  try {
-    const [result] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => Boolean(window.__deepframContentLoaded)
-    });
-
-    if (result?.result) {
-      return;
-    }
-  } catch (error) {
-    throw new Error(error.message || "ページにスクリプトを挿入できませんでした。");
-  }
-
   await chrome.scripting.insertCSS({
     target: { tabId },
     files: ["content.css"]
