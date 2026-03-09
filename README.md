@@ -1,6 +1,11 @@
-# Deepfram Extension
+# tab-live-translate-captions
 
-Deepgram のリアルタイム音声認識と Cloud Translation / Gemini を使って、現在の Chrome タブ音声を翻訳字幕としてページ上に重ねて表示する Manifest V3 拡張です。
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
+![Chrome Extension](https://img.shields.io/badge/Chrome-Extension-4285F4?logo=googlechrome&logoColor=white)
+![Manifest V3](https://img.shields.io/badge/Manifest-V3-1a73e8)
+![Node.js >= 18](https://img.shields.io/badge/Node.js-%3E%3D18-339933?logo=node.js&logoColor=white)
+
+`tab-live-translate-captions` は、Deepgram のリアルタイム音声認識と Cloud Translation / Gemini を使って、現在の Chrome タブ音声を翻訳字幕としてページ上に重ねて表示する Manifest V3 拡張です。
 
 ページ下部に字幕バーをオーバーレイ表示し、英語・中国語・日本語の音声をリアルタイムで翻訳します。
 
