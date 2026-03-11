@@ -47,6 +47,7 @@ function createDeepframOverlay(initialState = null) {
 
   const state = createInitialState(initialState);
   const elements = getElements(overlay);
+  const requestRender = () => render();
   const onMessage = (message, sender, sendResponse) => {
     if (!message?.type) {
       return undefined;
@@ -57,7 +58,7 @@ function createDeepframOverlay(initialState = null) {
       return undefined;
     }
 
-    applyMessageToState(state, message);
+    applyMessageToState(state, message, requestRender);
     if (message.type === MESSAGE_TYPES.clearOverlay) {
       syncOverlayHost(overlay);
     }
@@ -113,6 +114,7 @@ function createDeepframOverlay(initialState = null) {
       return snapshotState(state);
     },
     destroy() {
+      resetPendingTranslationState(state);
       chrome.runtime.onMessage.removeListener(onMessage);
       window.removeEventListener("resize", onResize);
       document.removeEventListener("fullscreenchange", onFullscreenChange);
@@ -172,7 +174,7 @@ function bindDragging({ overlay, elements, state }) {
   elements.dragHandle.addEventListener("pointercancel", finishDrag);
 }
 
-function applyMessageToState(state, message) {
+function applyMessageToState(state, message, onStateChanged = null) {
   switch (message.type) {
     case MESSAGE_TYPES.settingsUpdated:
       state.settings = {
@@ -183,6 +185,9 @@ function applyMessageToState(state, message) {
     case MESSAGE_TYPES.sessionStatusChanged:
       state.sessionStatus = message.status;
       state.statusText = message.message || state.statusText;
+      if ([SESSION_STATUS.idle, SESSION_STATUS.error, SESSION_STATUS.stopping].includes(message.status)) {
+        resetPendingTranslationState(state);
+      }
       if (message.status !== SESSION_STATUS.error) {
         state.errorText = "";
       }
@@ -203,18 +208,10 @@ function applyMessageToState(state, message) {
       }
       return;
     case MESSAGE_TYPES.finalTranslation:
-      if (Number(message.sequenceId || 0) < state.translationSequenceId) {
-        return;
-      }
-
-      state.sessionStatus = SESSION_STATUS.active;
-      state.translationSequenceId = Number(message.sequenceId || 0);
-      state.statusText = message.isFinal ? "字幕表示中" : "翻訳を生成中";
-      state.sourceText = message.sourceText || state.sourceText;
-      state.translationText = message.translation || "";
-      state.errorText = "";
+      handleIncomingTranslation(state, message, onStateChanged);
       return;
     case MESSAGE_TYPES.sessionError:
+      resetPendingTranslationState(state);
       state.sessionStatus = SESSION_STATUS.error;
       state.statusText = "要確認";
       state.errorText = message.error || "処理中にエラーが発生しました。";
@@ -228,6 +225,7 @@ function applyMessageToState(state, message) {
 }
 
 function clearState(state) {
+  resetPendingTranslationState(state);
   state.sessionStatus = SESSION_STATUS.idle;
   state.sourceText = "";
   state.previewText = "";
@@ -238,6 +236,7 @@ function clearState(state) {
 }
 
 function createInitialState(snapshot = null) {
+  const translationSequenceId = Number(snapshot?.translationSequenceId || 0);
   return {
     settings: {
       ...DEFAULT_SETTINGS,
@@ -247,9 +246,13 @@ function createInitialState(snapshot = null) {
     sourceText: snapshot?.sourceText || "",
     previewText: snapshot?.previewText || "",
     translationText: snapshot?.translationText || "",
-    translationSequenceId: Number(snapshot?.translationSequenceId || 0),
+    translationSequenceId,
     errorText: snapshot?.errorText || "",
-    statusText: snapshot?.statusText || "待機中"
+    statusText: snapshot?.statusText || "待機中",
+    displayedIsFinal: Boolean(snapshot?.translationText) && snapshot?.statusText === "字幕表示中",
+    displayHoldUntil: 0,
+    queuedTranslations: new Map(),
+    switchTimerId: null
   };
 }
 
@@ -302,4 +305,141 @@ function clampOffset(overlay, offset) {
     x: Math.max(-maxX, Math.min(maxX, Number(offset?.x || 0))),
     y: Math.max(minY, Math.min(maxY, Number(offset?.y || 0)))
   };
+}
+
+function handleIncomingTranslation(state, message, onStateChanged) {
+  const sequenceId = Number(message.sequenceId || 0);
+  if (!Number.isFinite(sequenceId) || sequenceId <= 0) {
+    return;
+  }
+
+  if (sequenceId < state.translationSequenceId) {
+    return;
+  }
+
+  const payload = {
+    sequenceId,
+    isFinal: Boolean(message.isFinal),
+    sourceText: message.sourceText || "",
+    translation: message.translation || ""
+  };
+
+  if (sequenceId === state.translationSequenceId) {
+    if (state.displayedIsFinal && !payload.isFinal) {
+      return;
+    }
+    applyDisplayedTranslation(state, payload);
+    reconcileQueuedTranslations(state, onStateChanged);
+    return;
+  }
+
+  queuePendingTranslation(state, payload);
+  reconcileQueuedTranslations(state, onStateChanged);
+}
+
+function queuePendingTranslation(state, payload) {
+  const existing = state.queuedTranslations.get(payload.sequenceId);
+  if (existing?.isFinal && !payload.isFinal) {
+    return;
+  }
+
+  state.queuedTranslations.set(payload.sequenceId, {
+    sequenceId: payload.sequenceId,
+    isFinal: Boolean(existing?.isFinal || payload.isFinal),
+    sourceText: payload.sourceText || existing?.sourceText || "",
+    translation: payload.translation || existing?.translation || ""
+  });
+}
+
+function applyDisplayedTranslation(state, payload) {
+  state.sessionStatus = SESSION_STATUS.active;
+  state.translationSequenceId = payload.sequenceId;
+  state.displayedIsFinal = Boolean(payload.isFinal);
+  state.statusText = payload.isFinal ? "字幕表示中" : "翻訳を生成中";
+  state.sourceText = payload.sourceText || state.sourceText;
+  state.translationText = payload.translation || "";
+  state.errorText = "";
+  state.displayHoldUntil = payload.isFinal ? Date.now() + calculateTranslationHoldMs(state.translationText) : 0;
+}
+
+function reconcileQueuedTranslations(state, onStateChanged) {
+  if (!state.queuedTranslations.size) {
+    clearTranslationSwitchTimer(state);
+    return;
+  }
+
+  if (shouldHoldDisplayedTranslation(state)) {
+    scheduleTranslationSwitch(state, onStateChanged);
+    return;
+  }
+
+  clearTranslationSwitchTimer(state);
+
+  const nextPayload = getNextQueuedTranslation(state);
+  if (!nextPayload) {
+    return;
+  }
+
+  state.queuedTranslations.delete(nextPayload.sequenceId);
+  applyDisplayedTranslation(state, nextPayload);
+
+  if (shouldHoldDisplayedTranslation(state)) {
+    scheduleTranslationSwitch(state, onStateChanged);
+    return;
+  }
+
+  reconcileQueuedTranslations(state, onStateChanged);
+}
+
+function getNextQueuedTranslation(state) {
+  let nextPayload = null;
+
+  for (const payload of state.queuedTranslations.values()) {
+    if (!nextPayload || payload.sequenceId < nextPayload.sequenceId) {
+      nextPayload = payload;
+    }
+  }
+
+  return nextPayload;
+}
+
+function shouldHoldDisplayedTranslation(state) {
+  return Boolean(state.translationSequenceId && state.displayedIsFinal && Date.now() < state.displayHoldUntil);
+}
+
+function scheduleTranslationSwitch(state, onStateChanged) {
+  const delayMs = Math.max(0, state.displayHoldUntil - Date.now());
+  clearTranslationSwitchTimer(state);
+
+  if (delayMs === 0) {
+    reconcileQueuedTranslations(state, onStateChanged);
+    return;
+  }
+
+  state.switchTimerId = setTimeout(() => {
+    state.switchTimerId = null;
+    reconcileQueuedTranslations(state, onStateChanged);
+    onStateChanged?.();
+  }, delayMs);
+}
+
+function clearTranslationSwitchTimer(state) {
+  if (!state.switchTimerId) {
+    return;
+  }
+
+  clearTimeout(state.switchTimerId);
+  state.switchTimerId = null;
+}
+
+function resetPendingTranslationState(state) {
+  clearTranslationSwitchTimer(state);
+  state.displayedIsFinal = false;
+  state.displayHoldUntil = 0;
+  state.queuedTranslations.clear();
+}
+
+function calculateTranslationHoldMs(translationText) {
+  const length = String(translationText || "").trim().length;
+  return Math.min(2400, Math.max(900, 480 + length * 55));
 }

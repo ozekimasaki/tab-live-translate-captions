@@ -7,7 +7,6 @@ const TARGET_SAMPLE_RATE = 16000;
 const KEEP_ALIVE_MS = 8000;
 const AUTO_STOP_MS = 5 * 60 * 1000;
 const GEMINI_MAX_OUTPUT_TOKENS = 64;
-const GEMINI_RETRY_DELAYS_MS = [180, 520];
 const MAX_CONCURRENT_TRANSLATIONS = 2;
 const TRANSLATION_UNAVAILABLE_TEXT = "翻訳を取得できませんでした。";
 const DEBUG_LOG_PREFIX = "[deepfram/offscreen]";
@@ -17,6 +16,12 @@ const TOKEN_TIME_TOLERANCE_MS = 80;
 const BUFFER_COMPACT_THRESHOLD = 48;
 const HARD_BOUNDARY_PUNCTUATION_RE = /[.!?。！？]$/u;
 const SOFT_BOUNDARY_PUNCTUATION_RE = /[,;:、，；：]$/u;
+const TRANSLATION_MAX_ATTEMPTS = 2;
+const CLOUD_TRANSLATION_TIMEOUT_MS = 4000;
+const CLOUD_TRANSLATION_RETRY_DELAY_MS = 250;
+const GEMINI_REQUEST_TIMEOUT_MS = 6000;
+const GEMINI_STREAM_INACTIVITY_TIMEOUT_MS = 4000;
+const GEMINI_RETRY_DELAY_MS = 350;
 const SPACELESS_LANGUAGES = new Set(["ja", "zh"]);
 const ENGLISH_SOFT_BOUNDARY_CONTINUERS = new Set([
   "and",
@@ -327,200 +332,168 @@ function bindDeepgramEvents(connection) {
   });
 }
 
-async function streamTranslateWithGemini({ apiKey, model, sourceLang, targetLang, text, signal, onUpdate }) {
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": apiKey
-      },
-      body: JSON.stringify(buildGeminiRequestBody(model, sourceLang, targetLang, text)),
-      signal
-    }
-  );
-
-  if (!response.ok) {
-    const bodyText = await response.text();
-    if (response.status === 400 || response.status === 404) {
-      const fallbackText = await translateWithGemini({
-        apiKey,
-        model,
-        sourceLang,
-        targetLang,
-        text,
-        disableThinking: true
-      });
-      await onUpdate(fallbackText, true);
-      return fallbackText;
-    }
-
-    throw new Error(`Gemini API ${response.status}: ${bodyText}`);
-  }
-
-  if (!response.body) {
-    throw new Error("Gemini のストリーム応答を取得できませんでした。");
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let assembledText = "";
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) {
-      buffer += decoder.decode();
-      break;
-    }
-
-    buffer += decoder.decode(value, { stream: true });
-
-    let eventBlock;
-    while ((eventBlock = takeNextSseEvent(buffer))) {
-      buffer = eventBlock.rest;
-      const chunkText = parseGeminiSseChunk(eventBlock.block);
-      if (!chunkText) {
-        continue;
-      }
-
-      assembledText += chunkText;
-      await onUpdate(assembledText.trimStart(), false);
-    }
-  }
-
-  const trailingChunk = parseGeminiSseChunk(buffer);
-  if (trailingChunk) {
-    assembledText += trailingChunk;
-  }
-
-  assembledText = assembledText.trim();
-  if (!assembledText) {
-    const fallbackText = await translateWithGemini({ apiKey, model, sourceLang, targetLang, text });
-    await onUpdate(fallbackText, true);
-    return fallbackText;
-  }
-
-  await onUpdate(assembledText, true);
-  return assembledText;
-}
-
-async function translateWithGeminiBestEffort({ apiKey, model, sourceLang, targetLang, text, signal, onUpdate }) {
-  let lastError = null;
-  let latestPartial = "";
-
-  const trackUpdate = async (translation, isFinal) => {
-    const normalized = normalizeModelText(translation);
-    if (normalized) {
-      latestPartial = normalized;
-    }
-    await onUpdate(normalized || translation, isFinal);
-  };
+async function streamTranslateWithGemini({ apiKey, model, sourceLang, targetLang, text, signal, onPartialUpdate }) {
+  const attemptSignal = createAttemptSignalManager(signal, {
+    timeoutMs: GEMINI_REQUEST_TIMEOUT_MS,
+    timeoutMessage: "Gemini の応答がタイムアウトしました。",
+    stallTimeoutMs: GEMINI_STREAM_INACTIVITY_TIMEOUT_MS,
+    stallMessage: "Gemini のストリーム応答が停止しました。"
+  });
 
   try {
-    return await streamTranslateWithGemini({
-      apiKey,
-      model,
-      sourceLang,
-      targetLang,
-      text,
-      signal,
-      onUpdate: trackUpdate
-    });
-  } catch (error) {
-    if (error?.name === "AbortError") {
-      throw error;
-    }
-    lastError = error;
-  }
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": apiKey
+        },
+        body: JSON.stringify(buildGeminiRequestBody(model, sourceLang, targetLang, text)),
+        signal: attemptSignal.signal
+      }
+    );
 
-  for (const delayMs of GEMINI_RETRY_DELAYS_MS) {
-    if (delayMs > 0) {
-      await sleep(delayMs);
+    if (!response.ok) {
+      const bodyText = await response.text();
+      if (response.status === 400 || response.status === 404) {
+        return translateWithGemini({
+          apiKey,
+          model,
+          sourceLang,
+          targetLang,
+          text,
+          disableThinking: true,
+          signal: attemptSignal.signal
+        });
+      }
+
+      throw createHttpError(`Gemini API ${response.status}: ${bodyText}`, response.status);
     }
 
-    try {
-      const translation = await translateWithGemini({
+    if (!response.body) {
+      throw createTranslationError("empty", "Gemini のストリーム応答を取得できませんでした。");
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let assembledText = "";
+
+    attemptSignal.touchStallTimeout();
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        buffer += decoder.decode();
+        attemptSignal.clearStallTimeout();
+        break;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+      attemptSignal.touchStallTimeout();
+
+      let eventBlock;
+      while ((eventBlock = takeNextSseEvent(buffer))) {
+        buffer = eventBlock.rest;
+        const chunkText = parseGeminiSseChunk(eventBlock.block);
+        if (!chunkText) {
+          continue;
+        }
+
+        assembledText += chunkText;
+        await onPartialUpdate(assembledText.trimStart());
+      }
+    }
+
+    const trailingChunk = parseGeminiSseChunk(buffer);
+    if (trailingChunk) {
+      assembledText += trailingChunk;
+    }
+
+    assembledText = assembledText.trim();
+    if (!assembledText) {
+      return translateWithGemini({
         apiKey,
         model,
         sourceLang,
         targetLang,
         text,
         disableThinking: true,
-        signal
+        signal: attemptSignal.signal
       });
-      await trackUpdate(translation, true);
-      return translation;
-    } catch (error) {
-      if (error?.name === "AbortError") {
-        throw error;
-      }
-      lastError = error;
     }
-  }
 
-  if (latestPartial) {
-    await onUpdate(latestPartial, true);
-    return latestPartial;
+    return assembledText;
+  } catch (error) {
+    throw attemptSignal.wrapError(error);
+  } finally {
+    attemptSignal.cleanup();
   }
-
-  throw lastError || new Error("Gemini から翻訳結果を取得できませんでした。");
 }
 
-async function translateWithProviderBestEffort({ provider, apiKey, model, sourceLang, targetLang, text, signal, onUpdate }) {
+async function translateWithProviderAttempt({ provider, apiKey, model, sourceLang, targetLang, text, signal, onPartialUpdate }) {
   if (provider === TRANSLATION_PROVIDERS.cloudTranslation) {
     return translateWithCloudTranslation({
       apiKey,
       sourceLang,
       targetLang,
       text,
-      signal,
-      onUpdate
+      signal
     });
   }
 
-  return translateWithGeminiBestEffort({
+  return streamTranslateWithGemini({
     apiKey,
     model,
     sourceLang,
     targetLang,
     text,
     signal,
-    onUpdate
+    onPartialUpdate
   });
 }
 
-async function translateWithCloudTranslation({ apiKey, sourceLang, targetLang, text, signal, onUpdate }) {
-  const response = await fetch(`${CLOUD_TRANSLATION_ENDPOINT}?key=${encodeURIComponent(apiKey)}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      q: text,
-      source: mapTranslationLanguage(TRANSLATION_PROVIDERS.cloudTranslation, sourceLang),
-      target: mapTranslationLanguage(TRANSLATION_PROVIDERS.cloudTranslation, targetLang),
-      format: "text"
-    }),
-    signal
+async function translateWithCloudTranslation({ apiKey, sourceLang, targetLang, text, signal }) {
+  const attemptSignal = createAttemptSignalManager(signal, {
+    timeoutMs: CLOUD_TRANSLATION_TIMEOUT_MS,
+    timeoutMessage: "Cloud Translation の応答がタイムアウトしました。"
   });
 
-  if (!response.ok) {
-    const bodyText = await response.text();
-    throw new Error(`Cloud Translation API ${response.status}: ${bodyText}`);
+  try {
+    const response = await fetch(`${CLOUD_TRANSLATION_ENDPOINT}?key=${encodeURIComponent(apiKey)}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        q: text,
+        source: mapTranslationLanguage(TRANSLATION_PROVIDERS.cloudTranslation, sourceLang),
+        target: mapTranslationLanguage(TRANSLATION_PROVIDERS.cloudTranslation, targetLang),
+        format: "text"
+      }),
+      signal: attemptSignal.signal
+    });
+
+    if (!response.ok) {
+      const bodyText = await response.text();
+      throw createHttpError(`Cloud Translation API ${response.status}: ${bodyText}`, response.status);
+    }
+
+    const data = await response.json();
+    const translatedText = decodeHtmlEntities(data?.data?.translations?.[0]?.translatedText || "");
+    const normalizedText = normalizeModelText(translatedText);
+
+    if (!normalizedText) {
+      throw createTranslationError("empty", "Cloud Translation から翻訳結果を取得できませんでした。");
+    }
+
+    return normalizedText;
+  } catch (error) {
+    throw attemptSignal.wrapError(error);
+  } finally {
+    attemptSignal.cleanup();
   }
-
-  const data = await response.json();
-  const translatedText = decodeHtmlEntities(data?.data?.translations?.[0]?.translatedText || "");
-  const normalizedText = normalizeModelText(translatedText);
-
-  if (!normalizedText) {
-    throw new Error("Cloud Translation から翻訳結果を取得できませんでした。");
-  }
-
-  await onUpdate(normalizedText, true);
-  return normalizedText;
 }
 
 function buildGeminiRequestBody(model, sourceLang, targetLang, text, { disableThinking = false } = {}) {
@@ -622,36 +595,150 @@ function isGemini3Model(modelName) {
 }
 
 async function translateWithGemini({ apiKey, model, sourceLang, targetLang, text, disableThinking = false, signal } = {}) {
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(buildGeminiRequestBody(model, sourceLang, targetLang, text, { disableThinking })),
-      signal
-    }
-  );
-
-  if (!response.ok) {
-    const bodyText = await response.text();
-    throw new Error(`Gemini API ${response.status}: ${bodyText}`);
-  }
-
-  const data = await response.json();
-  const translation = extractGeminiChunkText(data);
-
-  if (!translation) {
-    const reason = data?.promptFeedback?.blockReason || data?.candidates?.[0]?.finishReason;
-    throw new Error(
-      reason
-        ? `Gemini から翻訳結果を取得できませんでした (${reason})。`
-        : "Gemini から翻訳結果を取得できませんでした。"
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(buildGeminiRequestBody(model, sourceLang, targetLang, text, { disableThinking })),
+        signal
+      }
     );
+
+    if (!response.ok) {
+      const bodyText = await response.text();
+      throw createHttpError(`Gemini API ${response.status}: ${bodyText}`, response.status);
+    }
+
+    const data = await response.json();
+    const translation = extractGeminiChunkText(data);
+
+    if (!translation) {
+      const reason = data?.promptFeedback?.blockReason || data?.candidates?.[0]?.finishReason;
+      throw createTranslationError(
+        "empty",
+        reason
+          ? `Gemini から翻訳結果を取得できませんでした (${reason})。`
+          : "Gemini から翻訳結果を取得できませんでした。"
+      );
+    }
+
+    return translation;
+  } catch (error) {
+    if (error?.code || error?.name === "AbortError") {
+      throw error;
+    }
+
+    if (error instanceof TypeError) {
+      throw createTranslationError("network", error.message || "Gemini への接続に失敗しました。");
+    }
+
+    throw error;
+  }
+}
+
+function createTranslationError(code, message, extra = {}) {
+  const error = new Error(message);
+  error.code = code;
+  Object.assign(error, extra);
+  return error;
+}
+
+function createHttpError(message, status) {
+  return createTranslationError("http", message, { status });
+}
+
+function createAttemptSignalManager(parentSignal, { timeoutMs = 0, timeoutMessage, stallTimeoutMs = 0, stallMessage } = {}) {
+  const controller = new AbortController();
+  let abortError = null;
+  let parentAborted = false;
+  let timeoutId = null;
+  let stallTimeoutId = null;
+
+  const abortFromParent = () => {
+    parentAborted = true;
+    controller.abort();
+  };
+
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      abortFromParent();
+    } else {
+      parentSignal.addEventListener("abort", abortFromParent, { once: true });
+    }
   }
 
-  return translation;
+  const clearTimeouts = () => {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+      timeoutId = null;
+    }
+    if (stallTimeoutId) {
+      clearTimeout(stallTimeoutId);
+      stallTimeoutId = null;
+    }
+  };
+
+  const abortWithError = (error) => {
+    if (controller.signal.aborted) {
+      return;
+    }
+    abortError = error;
+    controller.abort();
+  };
+
+  if (timeoutMs > 0) {
+    timeoutId = setTimeout(() => {
+      abortWithError(createTranslationError("timeout", timeoutMessage || "翻訳の応答がタイムアウトしました。"));
+    }, timeoutMs);
+  }
+
+  const touchStallTimeout = () => {
+    if (stallTimeoutMs <= 0) {
+      return;
+    }
+
+    if (stallTimeoutId) {
+      clearTimeout(stallTimeoutId);
+    }
+
+    stallTimeoutId = setTimeout(() => {
+      abortWithError(createTranslationError("stall", stallMessage || "翻訳ストリームの応答が停止しました。"));
+    }, stallTimeoutMs);
+  };
+
+  return {
+    signal: controller.signal,
+    touchStallTimeout,
+    clearStallTimeout() {
+      if (!stallTimeoutId) {
+        return;
+      }
+      clearTimeout(stallTimeoutId);
+      stallTimeoutId = null;
+    },
+    wrapError(error) {
+      if (parentAborted || parentSignal?.aborted) {
+        return error;
+      }
+      if (abortError) {
+        return abortError;
+      }
+      if (error instanceof TypeError) {
+        return createTranslationError("network", error.message || "ネットワークエラーが発生しました。");
+      }
+      return error;
+    },
+    cleanup() {
+      clearTimeouts();
+      if (parentSignal) {
+        parentSignal.removeEventListener("abort", abortFromParent);
+      }
+    }
+  };
 }
 
 function buildTranslationPrompt(sourceLang, targetLang, text) {
@@ -1166,62 +1253,96 @@ async function pumpTranslationQueue(sessionId) {
 async function runTranslationTask(task, sessionId) {
   const abortController = new AbortController();
   session.translationAbortControllers.add(abortController);
+  let bestPartial = "";
+  let lastError = null;
+  let lastAttempt = 0;
+  let didComplete = false;
 
   try {
-    await translateWithProviderBestEffort({
-      provider: task.provider,
-      apiKey: task.apiKey,
-      model: task.model,
-      sourceLang: task.sourceLang,
-      targetLang: task.targetLang,
-      text: task.text,
-      signal: abortController.signal,
-      onUpdate: async (translation, isFinal) => {
-        if (session.sessionId !== sessionId || session.isStopping) {
-          return;
-        }
-
-        if (isFinal) {
-          clearStreamingPartialState(task.sequenceId);
-          session.completedTranslations.set(task.sequenceId, {
-            translation,
-            sourceText: task.text,
-            provider: task.provider
-          });
-          session.translationStreamingResults.delete(task.sequenceId);
-          debugLog("translation:completed", {
-            sessionId,
-            sequenceId: task.sequenceId,
-            provider: task.provider,
-            model: task.provider === TRANSLATION_PROVIDERS.gemini ? task.model : null,
-            waitingForDisplay: task.sequenceId !== session.nextDisplaySequenceId
-          });
-          await flushReadyTranslationResults(sessionId);
-          return;
-        }
-
-        await stageStreamingTranslationUpdate(task, translation, sessionId);
+    for (let attempt = 1; attempt <= TRANSLATION_MAX_ATTEMPTS; attempt += 1) {
+      lastAttempt = attempt;
+      if (attempt > 1) {
+        const delayMs = getTranslationRetryDelayMs(task.provider);
+        debugLog("translation:retry", {
+          sessionId,
+          sequenceId: task.sequenceId,
+          provider: task.provider,
+          model: task.provider === TRANSLATION_PROVIDERS.gemini ? task.model : null,
+          attempt,
+          delayMs,
+          reason: getTranslationErrorCode(lastError),
+          message: lastError?.message || null
+        });
+        await sleep(delayMs);
       }
-    });
+
+      if (session.sessionId !== sessionId || session.isStopping || abortController.signal.aborted) {
+        return;
+      }
+
+      try {
+        const translation = await translateWithProviderAttempt({
+          provider: task.provider,
+          apiKey: task.apiKey,
+          model: task.model,
+          sourceLang: task.sourceLang,
+          targetLang: task.targetLang,
+          text: task.text,
+          signal: abortController.signal,
+          onPartialUpdate: async (partialTranslation) => {
+            const normalized = normalizeModelText(partialTranslation);
+            if (!normalized) {
+              return;
+            }
+
+            bestPartial = selectPreferredPartial(bestPartial, normalized);
+            await stageStreamingTranslationUpdate(task, normalized, sessionId);
+          }
+        });
+
+        const finalTranslation = normalizeModelText(translation) || bestPartial || TRANSLATION_UNAVAILABLE_TEXT;
+        await completeTranslationTask(task, sessionId, finalTranslation, {
+          event: attempt > 1 ? "translation:recovered" : "translation:completed",
+          attempt
+        });
+        didComplete = true;
+        return;
+      } catch (error) {
+        if (abortController.signal.aborted && (session.isStopping || error?.name === "AbortError")) {
+          throw error;
+        }
+
+        lastError = normalizeTranslationError(error);
+        debugLog(getTranslationFailureEvent(lastError), {
+          sessionId,
+          sequenceId: task.sequenceId,
+          provider: task.provider,
+          model: task.provider === TRANSLATION_PROVIDERS.gemini ? task.model : null,
+          attempt,
+          reason: getTranslationErrorCode(lastError),
+          status: Number.isFinite(lastError?.status) ? lastError.status : null,
+          message: lastError?.message || String(lastError)
+        });
+
+        if (attempt >= TRANSLATION_MAX_ATTEMPTS || !shouldRetryTranslationError(lastError)) {
+          break;
+        }
+      }
+    }
   } catch (error) {
     if (error?.name !== "AbortError" && session.sessionId === sessionId && !session.isStopping) {
-      debugLog("translation:error", {
-        sessionId,
-        sequenceId: task.sequenceId,
-        provider: task.provider,
-        model: task.provider === TRANSLATION_PROVIDERS.gemini ? task.model : null,
-        message: error?.message || String(error)
-      });
-      session.completedTranslations.set(task.sequenceId, {
-        translation: TRANSLATION_UNAVAILABLE_TEXT,
-        sourceText: task.text,
-        provider: task.provider
-      });
-      clearStreamingPartialState(task.sequenceId);
-      session.translationStreamingResults.delete(task.sequenceId);
-      await flushReadyTranslationResults(sessionId);
+      lastError = normalizeTranslationError(error);
     }
   } finally {
+    if (session.sessionId === sessionId && !session.isStopping && !abortController.signal.aborted && !didComplete) {
+      await completeTranslationTask(task, sessionId, bestPartial || TRANSLATION_UNAVAILABLE_TEXT, {
+        event: "translation:fallback",
+        attempt: lastAttempt || 1,
+        message: lastError?.message || null,
+        fallbackSource: bestPartial ? "partial" : "unavailable"
+      });
+    }
+
     session.translationAbortControllers.delete(abortController);
 
     if (session.sessionId === sessionId) {
@@ -1237,6 +1358,99 @@ async function runTranslationTask(task, sessionId) {
       void pumpTranslationQueue(sessionId);
     }
   }
+}
+
+async function completeTranslationTask(task, sessionId, translation, { event, attempt, message = null, fallbackSource = null } = {}) {
+  if (session.sessionId !== sessionId || session.isStopping) {
+    return;
+  }
+
+  const finalTranslation = normalizeModelText(translation) || TRANSLATION_UNAVAILABLE_TEXT;
+  clearStreamingPartialState(task.sequenceId);
+  session.completedTranslations.set(task.sequenceId, {
+    translation: finalTranslation,
+    sourceText: task.text,
+    provider: task.provider
+  });
+  session.translationStreamingResults.delete(task.sequenceId);
+
+  debugLog(event, {
+    sessionId,
+    sequenceId: task.sequenceId,
+    provider: task.provider,
+    model: task.provider === TRANSLATION_PROVIDERS.gemini ? task.model : null,
+    attempt,
+    waitingForDisplay: task.sequenceId !== session.nextDisplaySequenceId,
+    message,
+    fallbackSource
+  });
+
+  await flushReadyTranslationResults(sessionId);
+}
+
+function normalizeTranslationError(error) {
+  if (!error) {
+    return createTranslationError("unknown", "翻訳処理で不明なエラーが発生しました。");
+  }
+
+  if (error.code) {
+    return error;
+  }
+
+  if (error instanceof TypeError) {
+    return createTranslationError("network", error.message || "ネットワークエラーが発生しました。");
+  }
+
+  return createTranslationError("unknown", error.message || String(error), {
+    status: Number.isFinite(error?.status) ? error.status : null,
+    cause: error
+  });
+}
+
+function getTranslationErrorCode(error) {
+  return error?.code || "unknown";
+}
+
+function shouldRetryTranslationError(error) {
+  const code = getTranslationErrorCode(error);
+  if (["timeout", "stall", "network", "empty"].includes(code)) {
+    return true;
+  }
+
+  const status = Number(error?.status);
+  return status === 408 || status === 429 || status >= 500;
+}
+
+function getTranslationFailureEvent(error) {
+  const code = getTranslationErrorCode(error);
+  if (code === "timeout") {
+    return "translation:timeout";
+  }
+  if (code === "stall") {
+    return "translation:stall";
+  }
+  return "translation:error";
+}
+
+function getTranslationRetryDelayMs(provider) {
+  return provider === TRANSLATION_PROVIDERS.cloudTranslation
+    ? CLOUD_TRANSLATION_RETRY_DELAY_MS
+    : GEMINI_RETRY_DELAY_MS;
+}
+
+function selectPreferredPartial(previousText, nextText) {
+  const previous = normalizeModelText(previousText);
+  const next = normalizeModelText(nextText);
+
+  if (!next) {
+    return previous;
+  }
+
+  if (!previous) {
+    return next;
+  }
+
+  return next.length >= previous.length ? next : previous;
 }
 
 async function flushReadyTranslationResults(sessionId) {
@@ -1782,6 +1996,12 @@ async function notifyBackground(message) {
   } catch {
     // service worker may be waking up
   }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 function maybeLogInterimProgress() {
