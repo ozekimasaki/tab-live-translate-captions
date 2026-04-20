@@ -3,7 +3,7 @@ class DeepframPcmRecorderProcessor extends AudioWorkletProcessor {
     super();
     this.targetSampleRate = options.processorOptions?.targetSampleRate || 16000;
     this.chunkSize = Math.round(this.targetSampleRate / 10);
-    this.silenceThreshold = 0.01;
+    this.silenceThreshold = 0.0035;
     this.silentForMs = 0;
     this.pending = [];
   }

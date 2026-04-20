@@ -1,4 +1,4 @@
-import { DEFAULT_SETTINGS, DISPLAY_MODES, MESSAGE_TYPES, SESSION_STATUS } from "./constants.js";
+import { DEFAULT_SETTINGS, DISPLAY_MODES, LATENCY_PREFERENCES, MESSAGE_TYPES, SESSION_STATUS } from "./constants.js";
 import { getLanguagePairLabel, getOverlayPlaceholder, getOverlayStatusLabel } from "./ui-copy.js";
 
 const preservedOverlayState = window.__deepframOverlayController?.exportState?.() || null;
@@ -177,10 +177,20 @@ function bindDragging({ overlay, elements, state }) {
 function applyMessageToState(state, message, onStateChanged = null) {
   switch (message.type) {
     case MESSAGE_TYPES.settingsUpdated:
+      const previousLatencyPreference = state.settings?.latencyPreference;
       state.settings = {
         ...state.settings,
         ...message.settings
       };
+      if (
+        previousLatencyPreference !== state.settings.latencyPreference &&
+        state.displayedIsFinal &&
+        state.translationText
+      ) {
+        state.displayHoldUntil =
+          Date.now() + calculateTranslationHoldMs(state.translationText, state.settings.latencyPreference);
+        reconcileQueuedTranslations(state, onStateChanged);
+      }
       return;
     case MESSAGE_TYPES.sessionStatusChanged:
       state.sessionStatus = message.status;
@@ -200,12 +210,20 @@ function applyMessageToState(state, message, onStateChanged = null) {
       return;
     case MESSAGE_TYPES.finalTranscript:
       state.sessionStatus = SESSION_STATUS.active;
-      state.statusText = "翻訳待ち";
+      state.statusText =
+        Number(message.sequenceId || 0) === state.translationSequenceId && state.translationText
+          ? state.displayedIsFinal
+            ? "字幕表示中"
+            : "翻訳を生成中"
+          : "翻訳待ち";
       state.previewText = "";
       state.errorText = "";
-      if (!state.translationText) {
-        state.sourceText = message.transcript || "";
-      }
+      state.sourceText =
+        Number(message.sequenceId || 0) === state.translationSequenceId && state.translationText
+          ? message.transcript || state.sourceText
+          : !state.translationText
+            ? message.transcript || ""
+            : state.sourceText;
       return;
     case MESSAGE_TYPES.finalTranslation:
       handleIncomingTranslation(state, message, onStateChanged);
@@ -328,6 +346,13 @@ function handleIncomingTranslation(state, message, onStateChanged) {
     if (state.displayedIsFinal && !payload.isFinal) {
       return;
     }
+    if (
+      !state.displayedIsFinal &&
+      !payload.isFinal &&
+      String(payload.translation || "").length < String(state.translationText || "").length
+    ) {
+      return;
+    }
     applyDisplayedTranslation(state, payload);
     reconcileQueuedTranslations(state, onStateChanged);
     return;
@@ -359,7 +384,9 @@ function applyDisplayedTranslation(state, payload) {
   state.sourceText = payload.sourceText || state.sourceText;
   state.translationText = payload.translation || "";
   state.errorText = "";
-  state.displayHoldUntil = payload.isFinal ? Date.now() + calculateTranslationHoldMs(state.translationText) : 0;
+  state.displayHoldUntil = payload.isFinal
+    ? Date.now() + calculateTranslationHoldMs(state.translationText, state.settings?.latencyPreference)
+    : 0;
 }
 
 function reconcileQueuedTranslations(state, onStateChanged) {
@@ -439,7 +466,14 @@ function resetPendingTranslationState(state) {
   state.queuedTranslations.clear();
 }
 
-function calculateTranslationHoldMs(translationText) {
+function calculateTranslationHoldMs(translationText, latencyPreference = DEFAULT_SETTINGS.latencyPreference) {
   const length = String(translationText || "").trim().length;
-  return Math.min(2400, Math.max(900, 480 + length * 55));
+  const baseHoldMs = 480 + length * 55;
+  if (latencyPreference === LATENCY_PREFERENCES.fastest) {
+    return Math.min(1600, Math.max(550, Math.round(baseHoldMs * 0.72)));
+  }
+  if (latencyPreference === LATENCY_PREFERENCES.stable) {
+    return Math.min(2600, Math.max(1000, Math.round(baseHoldMs * 1.12)));
+  }
+  return Math.min(2000, Math.max(720, Math.round(baseHoldMs * 0.88)));
 }

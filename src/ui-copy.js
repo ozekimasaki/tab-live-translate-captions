@@ -1,9 +1,13 @@
 import {
   DISPLAY_MODES,
   GEMINI_MODELS,
+  LATENCY_PREFERENCES,
+  normalizeSttProvider,
   PRESET_LANGUAGE_PAIRS,
   SEGMENTATION_MODES,
   SESSION_STATUS,
+  STT_PROVIDERS,
+  STT_PROVIDER_SOURCE_LANGUAGE_SUPPORT,
   TRANSLATION_PROVIDERS
 } from "./constants.js";
 
@@ -16,6 +20,11 @@ const LANGUAGE_LABELS = {
 const PROVIDER_LABELS = {
   [TRANSLATION_PROVIDERS.cloudTranslation]: "Cloud Translation",
   [TRANSLATION_PROVIDERS.gemini]: "Gemini"
+};
+
+const STT_PROVIDER_LABELS = {
+  [STT_PROVIDERS.deepgram]: "Deepgram",
+  [STT_PROVIDERS.xai]: "Grok / xAI"
 };
 
 export const DISPLAY_MODE_OPTIONS = [
@@ -49,6 +58,24 @@ export const SEGMENTATION_MODE_OPTIONS = [
   }
 ];
 
+export const LATENCY_PREFERENCE_OPTIONS = [
+  {
+    value: LATENCY_PREFERENCES.fastest,
+    label: "最速優先",
+    description: "差し替えや細かい更新を許容して初速を詰める"
+  },
+  {
+    value: LATENCY_PREFERENCES.balanced,
+    label: "バランス",
+    description: "初速と読みやすさのバランスを取る"
+  },
+  {
+    value: LATENCY_PREFERENCES.stable,
+    label: "安定優先",
+    description: "少し遅くても表示の揺れを抑える"
+  }
+];
+
 export const TRANSLATION_PROVIDER_OPTIONS = [
   {
     value: TRANSLATION_PROVIDERS.cloudTranslation,
@@ -59,6 +86,19 @@ export const TRANSLATION_PROVIDER_OPTIONS = [
     value: TRANSLATION_PROVIDERS.gemini,
     label: "Gemini",
     description: "生成モデルで翻訳する"
+  }
+];
+
+export const STT_PROVIDER_OPTIONS = [
+  {
+    value: STT_PROVIDERS.deepgram,
+    label: "Deepgram",
+    description: "既存のリアルタイム音声認識"
+  },
+  {
+    value: STT_PROVIDERS.xai,
+    label: "Grok / xAI",
+    description: "短い区間ごとに xAI へ送って低遅延に認識する"
   }
 ];
 
@@ -99,13 +139,77 @@ export function getTranslationProviderLabel(provider) {
   return PROVIDER_LABELS[provider] || "Translation";
 }
 
+export function getSttProviderLabel(provider) {
+  return STT_PROVIDER_LABELS[normalizeSttProvider(provider)] || "STT";
+}
+
+export function getSupportedLanguagePairsForSttProvider(sttProvider) {
+  const normalizedProvider = normalizeSttProvider(sttProvider);
+  const supportedSourceLanguages =
+    STT_PROVIDER_SOURCE_LANGUAGE_SUPPORT[normalizedProvider] ||
+    STT_PROVIDER_SOURCE_LANGUAGE_SUPPORT[STT_PROVIDERS.deepgram] ||
+    [];
+  return PRESET_LANGUAGE_PAIRS.filter((pair) => supportedSourceLanguages.includes(pair.sourceLang));
+}
+
+export function getSttCompatibilityHint(sttProvider, sourceLang) {
+  const normalizedProvider = normalizeSttProvider(sttProvider);
+  if (normalizedProvider === STT_PROVIDERS.xai && sourceLang === "zh") {
+    return "Grok / xAI STT は現在、中国語入力に対応していません。英語または日本語の翻訳方向を選んでください。";
+  }
+
+  if (normalizedProvider === STT_PROVIDERS.xai) {
+    return "Grok / xAI STT は現在、英語と日本語の入力に対応しています。短い発話区間ごとに xAI へ送って文字起こしします。";
+  }
+
+  return "";
+}
+
 export function getPopupStatusModel({ settings, sessionState, support }) {
-  const pairLabel = getLanguagePairLabel(settings.sourceLang, settings.targetLang);
-  const activeProvider = sessionState.translationProvider || settings.translationProvider;
-  const providerLabel = getTranslationProviderLabel(activeProvider);
-  const providerChangePending =
-    Boolean(sessionState.translationProvider) && sessionState.translationProvider !== settings.translationProvider;
-  const pendingProviderLabel = getTranslationProviderLabel(settings.translationProvider);
+  const sessionRunning = [SESSION_STATUS.starting, SESSION_STATUS.active, SESSION_STATUS.error].includes(sessionState.status);
+  const activeTranslationProvider = sessionState.translationProvider || settings.translationProvider;
+  const activeSttProvider = normalizeSttProvider(sessionState.sttProvider || settings.sttProvider);
+  const activeSourceLang = sessionRunning ? sessionState.sourceLang || settings.sourceLang : settings.sourceLang;
+  const activeTargetLang = sessionRunning ? sessionState.targetLang || settings.targetLang : settings.targetLang;
+  const pairLabel = getLanguagePairLabel(activeSourceLang, activeTargetLang);
+  const translationProviderLabel = getTranslationProviderLabel(activeTranslationProvider);
+  const sttProviderLabel = getSttProviderLabel(activeSttProvider);
+  const translationProviderChangePending =
+    sessionRunning && Boolean(sessionState.translationProvider) && sessionState.translationProvider !== settings.translationProvider;
+  const pendingSttProvider = normalizeSttProvider(settings.sttProvider);
+  const sttProviderChangePending = Boolean(sessionState.sttProvider) && activeSttProvider !== pendingSttProvider;
+  const geminiModelChangePending =
+    sessionRunning &&
+    activeTranslationProvider === TRANSLATION_PROVIDERS.gemini &&
+    Boolean(sessionState.geminiModel) &&
+    sessionState.geminiModel !== settings.geminiModel;
+  const languagePairChangePending =
+    sessionRunning &&
+    Boolean(sessionState.sourceLang) &&
+    (sessionState.sourceLang !== settings.sourceLang || sessionState.targetLang !== settings.targetLang);
+  const pendingTranslationProviderLabel = getTranslationProviderLabel(settings.translationProvider);
+  const pendingSttProviderLabel = getSttProviderLabel(pendingSttProvider);
+  const runtimeLabel = `${sttProviderLabel} · ${translationProviderLabel}`;
+  const sttRuntimeHint = getSttRuntimeHint(activeSttProvider);
+  const changeNotes = [];
+
+  if (translationProviderChangePending) {
+    changeNotes.push(`翻訳は ${pendingTranslationProviderLabel} を次回開始時に反映`);
+  }
+
+  if (geminiModelChangePending) {
+    changeNotes.push("Gemini モデルは次回開始時に反映");
+  }
+
+  if (sttProviderChangePending) {
+    changeNotes.push(`STT は ${pendingSttProviderLabel} を次回開始時に反映`);
+  }
+
+  if (languagePairChangePending) {
+    changeNotes.push("翻訳方向は次回開始時に反映");
+  }
+
+  const settingsHint = changeNotes.length > 0 ? ` ${changeNotes.join(" / ")}。` : "";
 
   if (!support.supported && sessionState.status !== SESSION_STATUS.active) {
     return {
@@ -113,7 +217,7 @@ export function getPopupStatusModel({ settings, sessionState, support }) {
       badge: "非対応",
       title: "このページでは開始できません",
       hint: support.reason,
-      pairLabel: `${providerLabel} · ${pairLabel}`
+      pairLabel: `${runtimeLabel} · ${pairLabel}`
     };
   }
 
@@ -123,40 +227,43 @@ export function getPopupStatusModel({ settings, sessionState, support }) {
         state: "starting",
         badge: "接続中",
         title: sessionState.message || "音声処理を開始しています",
-        hint: providerChangePending
-          ? `${providerLabel} で翻訳中です。${pendingProviderLabel} への切替は次回開始時に反映されます。`
-          : `${providerLabel} で翻訳します。最初の字幕が表示されるまで数秒かかることがあります。`,
-        pairLabel: `${providerLabel} · ${pairLabel}`
+        hint:
+          `${sttRuntimeHint} で音声認識し、${translationProviderLabel} で翻訳します。` +
+          `最初の字幕が表示されるまで数秒かかることがあります。${settingsHint}`.trim(),
+        pairLabel: `${runtimeLabel} · ${pairLabel}`
       };
     case SESSION_STATUS.active:
       return {
         state: "active",
         badge: "字幕中",
         title: sessionState.message || "翻訳字幕を表示しています",
-        hint: providerChangePending
-          ? `${providerLabel} で翻訳中です。${pendingProviderLabel} への切替は次回開始時に反映されます。`
-          : `${providerLabel} で翻訳中です。ページ下部の字幕バーはドラッグ移動できます。`,
-        pairLabel: `${providerLabel} · ${pairLabel}`
+        hint:
+          `${sttRuntimeHint} で音声認識し、${translationProviderLabel} で翻訳中です。` +
+          `ページ下部の字幕バーはドラッグ移動できます。${settingsHint}`.trim(),
+        pairLabel: `${runtimeLabel} · ${pairLabel}`
       };
     case SESSION_STATUS.error:
       return {
         state: "error",
         badge: "要確認",
         title: sessionState.message || "処理中にエラーが発生しました",
-        hint: providerChangePending
-          ? `${providerLabel} のエラーです。${pendingProviderLabel} への切替は次回開始時に反映されます。`
-          : `${providerLabel} の API キー、ネットワーク、対象タブの音声出力を確認してください。`,
-        pairLabel: `${providerLabel} · ${pairLabel}`
+        hint:
+          `${runtimeLabel} の API キー、ネットワーク、対象タブの音声出力を確認してください。${settingsHint}`.trim(),
+        pairLabel: `${runtimeLabel} · ${pairLabel}`
       };
     default:
       return {
         state: "idle",
         badge: "待機中",
         title: "開始すると現在のタブ音声を取得します",
-        hint: `通常の Web ページで使えます。既定の翻訳は ${providerLabel} を使います。`,
-        pairLabel: `${providerLabel} · ${pairLabel}`
+        hint: `通常の Web ページで使えます。既定では ${sttRuntimeHint} で音声認識し、${translationProviderLabel} で翻訳します。`,
+        pairLabel: `${runtimeLabel} · ${pairLabel}`
       };
   }
+}
+
+function getSttRuntimeHint(provider) {
+  return normalizeSttProvider(provider) === STT_PROVIDERS.xai ? "xAI low-latency HTTPS" : "Deepgram realtime";
 }
 
 export function getActiveTabSummary(activeTab, support) {

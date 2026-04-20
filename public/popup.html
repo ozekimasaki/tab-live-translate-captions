@@ -38,13 +38,26 @@
         </div>
 
         <label class="field">
-          <span>翻訳プロバイダ</span>
-          <select id="translationProvider"></select>
+          <span>音声認識プロバイダ</span>
+          <select id="sttProvider"></select>
+        </label>
+
+        <p id="sttCompatibilityHint" class="status-note" hidden></p>
+
+        <label id="deepgramApiKeyField" class="field">
+          <span>Deepgram API Key</span>
+          <input id="deepgramApiKey" type="password" placeholder="dg_key..." autocomplete="off">
+        </label>
+
+        <label id="xaiApiKeyField" class="field" hidden>
+          <span>xAI API Key</span>
+          <input id="xaiApiKey" type="password" placeholder="xai-..." autocomplete="off">
+          <small class="field-help">extension-only では direct realtime WebSocket を使わず、短い区間ごとに xAI STT へ送信します。</small>
         </label>
 
         <label class="field">
-          <span>Deepgram API Key</span>
-          <input id="deepgramApiKey" type="password" placeholder="dg_key..." autocomplete="off">
+          <span>翻訳プロバイダ</span>
+          <select id="translationProvider"></select>
         </label>
 
         <label class="field provider-field" data-provider-field="cloud-translation">
@@ -87,6 +100,11 @@
             <span>字幕の区切り</span>
             <select id="segmentationMode"></select>
           </label>
+
+          <label class="field">
+            <span>リアルタイム優先度</span>
+            <select id="latencyPreference"></select>
+          </label>
         </div>
 
         <label class="field checkbox-row">
@@ -112,6 +130,27 @@
           </div>
         </label>
       </section>
+
+      <details id="runtimeLogPanel" class="panel log-panel">
+        <summary class="log-summary">
+          <div>
+            <p class="section-eyebrow">デバッグ</p>
+            <h2>runtime log</h2>
+          </div>
+          <span id="logCount" class="log-count">0件</span>
+        </summary>
+
+        <div class="log-viewer-body">
+          <div class="log-toolbar">
+            <p id="logMeta" class="status-note">保存された runtime log はまだありません。</p>
+            <div class="log-actions">
+              <button id="copyLogsButton" class="tertiary" type="button">コピー</button>
+              <button id="clearLogsButton" class="tertiary danger" type="button">クリア</button>
+            </div>
+          </div>
+          <pre id="runtimeLogsOutput" class="log-output">保存された runtime log はまだありません。</pre>
+        </div>
+      </details>
 
       <section class="actions">
         <button id="startButton" class="primary" type="button">字幕を開始</button>

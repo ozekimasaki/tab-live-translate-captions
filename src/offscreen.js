@@ -1,15 +1,30 @@
 import { createClient, LiveTranscriptionEvents } from "@deepgram/sdk";
-import { DEFAULT_SETTINGS, MESSAGE_TYPES, SESSION_STATUS, TRANSLATION_PROVIDERS } from "./constants.js";
+import {
+  DEFAULT_SETTINGS,
+  LATENCY_PREFERENCES,
+  MESSAGE_TYPES,
+  RUNTIME_LOG_SOURCES,
+  SESSION_STATUS,
+  STT_CONNECTION_STATES,
+  STT_PROVIDER_EVENTS,
+  STT_PROVIDERS,
+  STT_TRANSPORTS,
+  TRANSLATION_PROVIDERS
+} from "./constants.js";
+import { createRuntimeLogger } from "./runtime-log.js";
 
 const DEEPGRAM_MODEL = "nova-3";
 const CLOUD_TRANSLATION_ENDPOINT = "https://translation.googleapis.com/language/translate/v2";
+const XAI_STT_ENDPOINT = "https://api.x.ai/v1/stt";
 const TARGET_SAMPLE_RATE = 16000;
+const PCM_BYTES_PER_SAMPLE = 2;
 const KEEP_ALIVE_MS = 8000;
 const AUTO_STOP_MS = 5 * 60 * 1000;
 const GEMINI_MAX_OUTPUT_TOKENS = 64;
 const MAX_CONCURRENT_TRANSLATIONS = 2;
 const TRANSLATION_UNAVAILABLE_TEXT = "翻訳を取得できませんでした。";
 const DEBUG_LOG_PREFIX = "[deepfram/offscreen]";
+const runtimeLogger = createRuntimeLogger(RUNTIME_LOG_SOURCES.offscreen, DEBUG_LOG_PREFIX);
 const STREAMING_UPDATE_DEBOUNCE_MS = 140;
 const STREAMING_MIN_EMIT_CHARS = 6;
 const TOKEN_TIME_TOLERANCE_MS = 80;
@@ -22,6 +37,17 @@ const CLOUD_TRANSLATION_RETRY_DELAY_MS = 250;
 const GEMINI_REQUEST_TIMEOUT_MS = 6000;
 const GEMINI_STREAM_INACTIVITY_TIMEOUT_MS = 4000;
 const GEMINI_RETRY_DELAY_MS = 350;
+const BACKGROUND_DELIVERY_MAX_ATTEMPTS = 8;
+const BACKGROUND_DELIVERY_RETRY_BASE_MS = 120;
+const XAI_STT_MAX_ATTEMPTS = 2;
+const XAI_STT_TIMEOUT_MS = 12000;
+const XAI_STT_RETRY_DELAY_MS = 500;
+const XAI_MIN_SPEECH_MS = 220;
+const XAI_VAD_LEVEL_FLOOR = 0.0035;
+const XAI_PCM_MIME_TYPE = "audio/L16";
+const XAI_RAW_AUDIO_FORMAT = "pcm";
+const XAI_PROVIDER_ALIASES = new Set(["xai", "grok", "grok-stt", "grok-stt-rest"]);
+const XAI_FORMATTING_LANGUAGES = new Set(["en", "ja"]);
 const SPACELESS_LANGUAGES = new Set(["ja", "zh"]);
 const ENGLISH_SOFT_BOUNDARY_CONTINUERS = new Set([
   "and",
@@ -65,9 +91,38 @@ const SEGMENTATION_PROFILES = {
     maxDurationMs: 4600
   }
 };
+const LATENCY_BEHAVIOR_PROFILES = {
+  [LATENCY_PREFERENCES.fastest]: {
+    deepgramSpeculativeMinChars: 8,
+    deepgramSpeculativeDebounceMs: 180,
+    xaiSilenceOffsetMs: -70,
+    xaiMaxTurnOffsetMs: -220,
+    xaiPreRollOffsetMs: -30
+  },
+  [LATENCY_PREFERENCES.balanced]: {
+    deepgramSpeculativeMinChars: 12,
+    deepgramSpeculativeDebounceMs: 260,
+    xaiSilenceOffsetMs: 0,
+    xaiMaxTurnOffsetMs: 0,
+    xaiPreRollOffsetMs: 0
+  },
+  [LATENCY_PREFERENCES.stable]: {
+    deepgramSpeculativeMinChars: 18,
+    deepgramSpeculativeDebounceMs: 420,
+    xaiSilenceOffsetMs: 120,
+    xaiMaxTurnOffsetMs: 360,
+    xaiPreRollOffsetMs: 40
+  }
+};
+const GUARDED_BACKGROUND_MESSAGE_TYPES = new Set([
+  MESSAGE_TYPES.sessionError,
+  MESSAGE_TYPES.sessionStatusChanged
+]);
 
 let nextSessionId = 1;
 let session = createEmptySession();
+const backgroundDeliveryQueue = [];
+let isPumpingBackgroundDeliveryQueue = false;
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || message.recipient !== "offscreen") {
@@ -92,6 +147,9 @@ async function handleMessage(message) {
       await startSession(message.payload);
       return {};
     case MESSAGE_TYPES.settingsUpdated:
+      if (session.settings?.latencyPreference !== message.settings?.latencyPreference) {
+        clearSpeculativeTranslationState();
+      }
       session.settings = {
         ...session.settings,
         ...message.settings
@@ -106,27 +164,38 @@ async function handleMessage(message) {
   }
 }
 
-async function startSession({ tabId, streamId, settings }) {
+async function startSession({ tabId, streamId, settings, runtimeSessionId }) {
   await stopSession();
 
   session = createEmptySession();
   session.tabId = tabId;
   session.settings = settings;
-  session.deepgram = createClient(settings.deepgramApiKey);
+  session.runtimeSessionId = runtimeSessionId || null;
+  session.sttProvider = getSttProvider(settings);
+  session.sttTransport = getSttTransport(settings);
+  session.sttConnectionState = STT_CONNECTION_STATES.connecting;
+  if (session.sttProvider === STT_PROVIDERS.deepgram) {
+    session.deepgram = createClient(settings.deepgramApiKey);
+  }
   debugLog("session:start", {
     sessionId: session.sessionId,
     tabId,
+    sttProvider: session.sttProvider,
     translationProvider: settings.translationProvider,
     geminiModel: settings.translationProvider === TRANSLATION_PROVIDERS.gemini ? getGeminiModel(settings) : null,
     sourceLang: settings.sourceLang,
     targetLang: settings.targetLang,
-    segmentationMode: settings.segmentationMode
+    segmentationMode: settings.segmentationMode,
+    latencyPreference: settings.latencyPreference
   });
 
   await notifyBackground({
     type: MESSAGE_TYPES.sessionStatusChanged,
     status: SESSION_STATUS.starting,
-    message: "Deepgram に接続しています…"
+    message: getSessionStartingMessage(session.sttProvider, session.sttTransport),
+    sttTransport: session.sttTransport,
+    sttConnectionState: session.sttConnectionState,
+    utteranceIndex: session.utteranceIndex
   });
 
   try {
@@ -195,7 +264,7 @@ async function startSession({ tabId, streamId, settings }) {
     session.recorderNode = recorderNode;
 
     recorderNode.port.onmessage = (event) => {
-      if (!session.connection || !event.data?.audioBuffer) {
+      if (!event.data?.audioBuffer || session.isStopping) {
         return;
       }
 
@@ -204,6 +273,7 @@ async function startSession({ tabId, streamId, settings }) {
 
       if (!session.hasReceivedAudio) {
         session.hasReceivedAudio = true;
+        session.sttConnectionState = STT_CONNECTION_STATES.streaming;
         debugLog("audio:detected", {
           sessionId: session.sessionId,
           sampleRate: TARGET_SAMPLE_RATE
@@ -211,36 +281,68 @@ async function startSession({ tabId, streamId, settings }) {
         notifyBackground({
           type: MESSAGE_TYPES.sessionStatusChanged,
           status: SESSION_STATUS.active,
-          message: "タブ音声を検出しました。文字起こしを待っています…"
+          message: getSpeechDetectedMessage(session.sttProvider, session.sttTransport),
+          sttTransport: session.sttTransport,
+          sttConnectionState: session.sttConnectionState,
+          utteranceIndex: session.utteranceIndex
         });
+      }
+
+      if (session.sttProvider === STT_PROVIDERS.xai) {
+        void handleXaiAudioChunk(event.data);
+        return;
+      }
+
+      if (!session.connection) {
+        return;
       }
 
       session.connection.send(event.data.audioBuffer);
     };
 
-    const segmentationProfile = getSegmentationProfile(settings.segmentationMode);
-    debugLog("deepgram:connect", {
-      sessionId: session.sessionId,
-      endpointingMs: segmentationProfile.endpointingMs,
-      wordGapMs: segmentationProfile.wordGapMs,
-      maxWords: segmentationProfile.maxWords
-    });
-    session.connection = session.deepgram.listen.live({
-      model: DEEPGRAM_MODEL,
-      language: mapDeepgramLanguage(settings.sourceLang),
-      punctuate: true,
-      smart_format: true,
-      utterances: true,
-      interim_results: true,
-      endpointing: segmentationProfile.endpointingMs,
-      utterance_end_ms: 1000,
-      vad_events: true,
-      encoding: "linear16",
-      sample_rate: TARGET_SAMPLE_RATE,
-      channels: 1
-    });
+    if (session.sttProvider === STT_PROVIDERS.deepgram) {
+      const segmentationProfile = getSegmentationProfile(settings.segmentationMode);
+      debugLog("deepgram:connect", {
+        sessionId: session.sessionId,
+        endpointingMs: segmentationProfile.endpointingMs,
+        wordGapMs: segmentationProfile.wordGapMs,
+        maxWords: segmentationProfile.maxWords
+      });
+      session.connection = session.deepgram.listen.live({
+        model: DEEPGRAM_MODEL,
+        language: mapDeepgramLanguage(settings.sourceLang),
+        punctuate: true,
+        smart_format: true,
+        utterances: true,
+        interim_results: true,
+        endpointing: segmentationProfile.endpointingMs,
+        utterance_end_ms: 1000,
+        vad_events: true,
+        encoding: "linear16",
+        sample_rate: TARGET_SAMPLE_RATE,
+        channels: 1
+      });
 
-    bindDeepgramEvents(session.connection);
+      bindDeepgramEvents(session.connection);
+    } else {
+      const xaiTurnProfile = getXaiTurnProfile(settings.segmentationMode, settings.latencyPreference);
+      session.sttConnectionState = STT_CONNECTION_STATES.ready;
+      debugLog("xai:ready", {
+        sessionId: session.sessionId,
+        silenceFlushMs: xaiTurnProfile.silenceFlushMs,
+        maxTurnMs: xaiTurnProfile.maxTurnMs,
+        preRollMs: xaiTurnProfile.preRollMs
+      });
+      await notifyBackground({
+        type: MESSAGE_TYPES.sessionStatusChanged,
+        status: SESSION_STATUS.active,
+        message: "タブ音声を待機しています…",
+        sttTransport: session.sttTransport,
+        sttConnectionState: session.sttConnectionState,
+        utteranceIndex: session.utteranceIndex
+      });
+    }
+
     resetAutoStopTimer();
   } catch (error) {
     await handleFatalError(error);
@@ -250,6 +352,7 @@ async function startSession({ tabId, streamId, settings }) {
 
 function bindDeepgramEvents(connection) {
   connection.on(LiveTranscriptionEvents.Open, async () => {
+    session.sttConnectionState = STT_CONNECTION_STATES.streaming;
     debugLog("deepgram:open", {
       sessionId: session.sessionId
     });
@@ -260,7 +363,10 @@ function bindDeepgramEvents(connection) {
     await notifyBackground({
       type: MESSAGE_TYPES.sessionStatusChanged,
       status: SESSION_STATUS.active,
-      message: "字幕生成中"
+      message: "字幕生成中",
+      sttTransport: session.sttTransport,
+      sttConnectionState: session.sttConnectionState,
+      utteranceIndex: session.utteranceIndex
     });
   });
 
@@ -330,6 +436,362 @@ function bindDeepgramEvents(connection) {
     });
     await handleFatalError(new Error("Deepgram 接続が終了しました。"));
   });
+}
+
+async function handleXaiAudioChunk(data) {
+  const audioBuffer = cloneAudioBuffer(data?.audioBuffer);
+  if (!audioBuffer.byteLength) {
+    return;
+  }
+
+  const level = Number(data?.level || 0);
+  const rawIsSilent = Boolean(data?.isSilent);
+  const isSpeechLike = !rawIsSilent || level >= XAI_VAD_LEVEL_FLOOR;
+  const chunk = {
+    audioBuffer,
+    durationMs: getPcmDurationMs(audioBuffer),
+    isSilent: !isSpeechLike,
+    level
+  };
+  const profile = getXaiTurnProfile(session.settings?.segmentationMode, session.settings?.latencyPreference);
+
+  if (!session.xaiCurrentTurn) {
+    if (chunk.isSilent) {
+      rememberXaiPreRollChunk(chunk, profile.preRollMs);
+      return;
+    }
+
+    if (rawIsSilent) {
+      debugLog("xai:vad-override", {
+        sessionId: session.sessionId,
+        level
+      });
+    }
+    startXaiTurn();
+  }
+
+  appendChunkToXaiTurn(chunk);
+
+  if (!chunk.isSilent) {
+    resetAutoStopTimer();
+  }
+
+  const flushReason = getXaiTurnFlushReason(profile);
+  if (flushReason) {
+    await flushCurrentXaiTurn(flushReason);
+  }
+}
+
+function startXaiTurn() {
+  const preRollChunks = session.xaiPreRollChunks;
+  let durationMs = 0;
+  let trailingSilenceMs = 0;
+
+  if (preRollChunks.length) {
+    durationMs = preRollChunks.reduce((total, chunk) => total + chunk.durationMs, 0);
+    trailingSilenceMs = durationMs;
+  }
+
+  session.xaiCurrentTurn = {
+    chunks: [...preRollChunks],
+    durationMs,
+    speechMs: 0,
+    trailingSilenceMs
+  };
+  session.xaiPreRollChunks = [];
+  debugLog("xai:turn-start", {
+    sessionId: session.sessionId,
+    preRollMs: durationMs
+  });
+}
+
+function appendChunkToXaiTurn(chunk) {
+  if (!session.xaiCurrentTurn) {
+    return;
+  }
+
+  session.xaiCurrentTurn.chunks.push(chunk);
+  session.xaiCurrentTurn.durationMs += chunk.durationMs;
+
+  if (chunk.isSilent) {
+    session.xaiCurrentTurn.trailingSilenceMs += chunk.durationMs;
+    return;
+  }
+
+  session.xaiCurrentTurn.speechMs += chunk.durationMs;
+  session.xaiCurrentTurn.trailingSilenceMs = 0;
+}
+
+function rememberXaiPreRollChunk(chunk, preRollMs) {
+  session.xaiPreRollChunks.push(chunk);
+
+  let totalDurationMs = session.xaiPreRollChunks.reduce((total, item) => total + item.durationMs, 0);
+  while (session.xaiPreRollChunks.length > 1 && totalDurationMs > preRollMs) {
+    totalDurationMs -= session.xaiPreRollChunks.shift()?.durationMs || 0;
+  }
+}
+
+function getXaiTurnFlushReason(profile) {
+  const turn = session.xaiCurrentTurn;
+  if (!turn) {
+    return null;
+  }
+
+  if (turn.trailingSilenceMs >= profile.silenceFlushMs) {
+    return "silence";
+  }
+
+  if (turn.durationMs >= profile.maxTurnMs) {
+    return "duration";
+  }
+
+  return null;
+}
+
+async function flushCurrentXaiTurn(reason) {
+  const turn = session.xaiCurrentTurn;
+  session.xaiCurrentTurn = null;
+
+  if (!turn || turn.speechMs < XAI_MIN_SPEECH_MS || !turn.chunks.length) {
+    if (turn?.chunks.length) {
+      debugLog("xai:skip-turn", {
+        sessionId: session.sessionId,
+        reason: "too-short",
+        flushReason: reason,
+        durationMs: turn.durationMs,
+        speechMs: turn.speechMs
+      });
+    }
+    return;
+  }
+
+  const audioBuffer = mergePcmChunks(turn.chunks);
+  if (!audioBuffer.byteLength) {
+    return;
+  }
+
+  session.utteranceIndex += 1;
+  session.xaiTurnQueue.push({
+    audioBuffer,
+    durationMs: turn.durationMs,
+    speechMs: turn.speechMs,
+    reason
+  });
+  debugLog("xai:turn-flush", {
+    sessionId: session.sessionId,
+    reason,
+    durationMs: turn.durationMs,
+    speechMs: turn.speechMs,
+    queueLength: session.xaiTurnQueue.length
+  });
+  await notifyBackground({
+    type: MESSAGE_TYPES.sessionStatusChanged,
+    status: SESSION_STATUS.active,
+    message: "xAI に音声区間を送信しています…",
+    sttTransport: session.sttTransport,
+    sttConnectionState: session.sttConnectionState,
+    utteranceIndex: session.utteranceIndex
+  });
+  void pumpXaiTurnQueue(session.sessionId);
+}
+
+async function pumpXaiTurnQueue(sessionId) {
+  if (session.isPumpingXaiTurnQueue) {
+    return;
+  }
+
+  session.isPumpingXaiTurnQueue = true;
+
+  try {
+    while (session.sessionId === sessionId && !session.isStopping && session.xaiTurnQueue.length > 0) {
+      const turn = session.xaiTurnQueue.shift();
+      if (!turn) {
+        continue;
+      }
+
+      await transcribeXaiTurn(turn, sessionId);
+    }
+  } finally {
+    if (session.sessionId === sessionId) {
+      session.isPumpingXaiTurnQueue = false;
+    }
+  }
+}
+
+async function transcribeXaiTurn(turn, sessionId) {
+  const abortController = new AbortController();
+  session.transcriptionAbortControllers.add(abortController);
+  let lastError = null;
+
+  try {
+    for (let attempt = 1; attempt <= XAI_STT_MAX_ATTEMPTS; attempt += 1) {
+      if (attempt > 1) {
+        debugLog("xai:retry", {
+          sessionId,
+          attempt,
+          reason: getTranscriptionErrorCode(lastError),
+          message: lastError?.message || null
+        });
+        await sleep(XAI_STT_RETRY_DELAY_MS);
+      }
+
+      if (session.sessionId !== sessionId || session.isStopping || abortController.signal.aborted) {
+        return;
+      }
+
+      try {
+        debugLog("xai:request-start", {
+          sessionId,
+          attempt,
+          utteranceIndex: session.utteranceIndex,
+          durationMs: turn.durationMs,
+          speechMs: turn.speechMs
+        });
+        await notifyBackground({
+          type: MESSAGE_TYPES.sessionStatusChanged,
+          status: SESSION_STATUS.active,
+          message: "xAI で文字起こし中です…",
+          sttTransport: session.sttTransport,
+          sttConnectionState: session.sttConnectionState,
+          utteranceIndex: session.utteranceIndex
+        });
+        const payload = await requestXaiTranscription({
+          apiKey: getXaiApiKey(session.settings),
+          sourceLang: session.settings?.sourceLang,
+          audioBuffer: turn.audioBuffer,
+          signal: abortController.signal
+        });
+        const transcript = extractXaiTranscript(payload, session.settings?.sourceLang);
+        if (!transcript) {
+          throw createTranscriptionError("empty", "xAI から文字起こしを取得できませんでした。");
+        }
+
+        const recoveredAfterFailures = session.xaiConsecutiveTurnFailures > 0;
+        session.xaiConsecutiveTurnFailures = 0;
+        debugLog("xai:completed", {
+          sessionId,
+          attempt,
+          durationMs: turn.durationMs,
+          speechMs: turn.speechMs,
+          chars: transcript.length
+        });
+        await emitFinalTranscriptSegment(transcript);
+        if (recoveredAfterFailures && !session.isStopping && session.sessionId === sessionId) {
+          await notifyBackground({
+            type: MESSAGE_TYPES.sessionStatusChanged,
+            status: SESSION_STATUS.active,
+            message: getSpeechDetectedMessage(session.sttProvider, session.sttTransport),
+            sttTransport: session.sttTransport,
+            sttConnectionState: session.sttConnectionState,
+            utteranceIndex: session.utteranceIndex
+          });
+        }
+        return;
+      } catch (error) {
+        if (abortController.signal.aborted && (session.isStopping || error?.name === "AbortError")) {
+          throw error;
+        }
+
+        lastError = normalizeTranscriptionError(error);
+        debugLog("xai:error", {
+          sessionId,
+          attempt,
+          reason: getTranscriptionErrorCode(lastError),
+          status: Number.isFinite(lastError?.status) ? lastError.status : null,
+          message: lastError?.message || String(lastError)
+        });
+
+        if (attempt >= XAI_STT_MAX_ATTEMPTS || !shouldRetryTranscriptionError(lastError)) {
+          throw lastError;
+        }
+      }
+    }
+  } catch (error) {
+    if (error?.name !== "AbortError" && session.sessionId === sessionId && !session.isStopping) {
+      const normalizedError = normalizeTranscriptionError(error);
+      if (shouldSkipTranscriptionError(normalizedError)) {
+        await handleSkippedXaiTurn(normalizedError, sessionId);
+        return;
+      }
+
+      await handleFatalError(normalizedError);
+    }
+  } finally {
+    session.transcriptionAbortControllers.delete(abortController);
+  }
+}
+
+async function requestXaiTranscription({ apiKey, sourceLang, audioBuffer, signal }) {
+  const attemptSignal = createAttemptSignalManager(signal, {
+    timeoutMs: XAI_STT_TIMEOUT_MS,
+    timeoutMessage: "xAI の文字起こしがタイムアウトしました。"
+  });
+
+  try {
+    if (!apiKey) {
+      throw createTranscriptionError("auth", "xAI API Key を入力してください。");
+    }
+
+    const formData = new FormData();
+    const language = mapXaiLanguage(sourceLang);
+    formData.append("audio_format", XAI_RAW_AUDIO_FORMAT);
+    formData.append("sample_rate", String(TARGET_SAMPLE_RATE));
+
+    if (language && XAI_FORMATTING_LANGUAGES.has(language)) {
+      formData.append("language", language);
+      formData.append("format", "true");
+    }
+
+    formData.append("file", new Blob([audioBuffer], { type: XAI_PCM_MIME_TYPE }), "turn.pcm");
+
+    const response = await fetch(XAI_STT_ENDPOINT, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: formData,
+      signal: attemptSignal.signal
+    });
+
+    if (!response.ok) {
+      const bodyText = await response.text();
+      throw createHttpError(`xAI STT API ${response.status}: ${bodyText}`, response.status);
+    }
+
+    return response.json();
+  } catch (error) {
+    throw attemptSignal.wrapError(error);
+  } finally {
+    attemptSignal.cleanup();
+  }
+}
+
+function extractXaiTranscript(payload, sourceLang) {
+  const directText = normalizeModelText(payload?.text);
+  if (directText) {
+    return directText;
+  }
+
+  const words = Array.isArray(payload?.words) ? payload.words.map(createXaiWordToken).filter(Boolean) : [];
+  return buildTranscriptFromTokens(words, sourceLang);
+}
+
+function createXaiWordToken(word) {
+  const displayText = normalizeTokenText(word?.text);
+  if (!displayText) {
+    return null;
+  }
+
+  return {
+    baseText: displayText,
+    displayText,
+    startMs: toMilliseconds(word?.start),
+    endMs: toMilliseconds(word?.end)
+  };
+}
+
+function maybeLogXaiInterimProgress() {
+  return undefined;
 }
 
 async function streamTranslateWithGemini({ apiKey, model, sourceLang, targetLang, text, signal, onPartialUpdate }) {
@@ -757,13 +1219,17 @@ function buildTranslationPrompt(sourceLang, targetLang, text) {
 }
 
 async function handleFatalError(error) {
+  session.sttConnectionState = STT_CONNECTION_STATES.closed;
   debugLog("session:error", {
     sessionId: session.sessionId,
     message: error?.message || "音声処理でエラーが発生しました。"
   });
   await notifyBackground({
     type: MESSAGE_TYPES.sessionError,
-    error: error?.message || "音声処理でエラーが発生しました。"
+    error: error?.message || "音声処理でエラーが発生しました。",
+    sttTransport: session.sttTransport,
+    sttConnectionState: session.sttConnectionState,
+    utteranceIndex: session.utteranceIndex
   });
   await stopSession();
 }
@@ -790,12 +1256,24 @@ async function stopSession() {
 
   clearSoftBoundaryTimer();
 
+  session.xaiCurrentTurn = null;
+  session.xaiPreRollChunks.length = 0;
+  session.xaiTurnQueue.length = 0;
+  session.isPumpingXaiTurnQueue = false;
   session.translationQueue.length = 0;
   session.activeTranslationCount = 0;
   session.isPumpingTranslationQueue = false;
   session.completedTranslations.clear();
   session.translationStreamingResults.clear();
+  clearSpeculativeTranslationState();
   clearAllStreamingPartialState();
+
+  if (session.transcriptionAbortControllers.size) {
+    for (const controller of session.transcriptionAbortControllers) {
+      controller.abort();
+    }
+    session.transcriptionAbortControllers.clear();
+  }
 
   if (session.translationAbortControllers.size) {
     for (const controller of session.translationAbortControllers) {
@@ -804,7 +1282,7 @@ async function stopSession() {
     session.translationAbortControllers.clear();
   }
 
-  if (session.connection) {
+  if (typeof session.connection?.requestClose === "function") {
     try {
       session.connection.requestClose();
     } catch {
@@ -831,6 +1309,11 @@ async function stopSession() {
 }
 
 async function reschedulePendingTimers() {
+  if (session.sttProvider === STT_PROVIDERS.xai) {
+    await maybeFlushPendingXaiTurn("settings-updated");
+    return;
+  }
+
   clearSoftBoundaryTimer();
   await evaluatePendingBoundaries("settings-updated");
 }
@@ -853,13 +1336,23 @@ function getPendingFinalizedText(endIndexAbsolute = session.finalWordBuffer.leng
 }
 
 async function publishPreviewTranscript() {
-  if (!session.settings?.showSourcePreview || session.isStopping) {
+  if (session.isStopping) {
+    return;
+  }
+
+  const previewTranscript = buildPreviewTranscript();
+  maybeScheduleSpeculativeTranslation(previewTranscript);
+
+  if (!session.settings?.showSourcePreview) {
     return;
   }
 
   await notifyBackground({
     type: MESSAGE_TYPES.partialTranscript,
-    transcript: buildPreviewTranscript()
+    transcript: previewTranscript,
+    sttTransport: session.sttTransport,
+    sttConnectionState: session.sttConnectionState,
+    utteranceIndex: session.utteranceIndex
   });
 }
 
@@ -867,6 +1360,207 @@ function buildPreviewTranscript() {
   const finalizedText = getPendingFinalizedText();
   const interimTail = trimKnownPrefix(session.latestInterimTail, finalizedText);
   return mergePreviewSegments(finalizedText, interimTail, session.settings?.sourceLang);
+}
+
+function maybeScheduleSpeculativeTranslation(previewTranscript) {
+  if (session.sttProvider !== STT_PROVIDERS.deepgram || session.isStopping) {
+    clearSpeculativeTranslationState();
+    return;
+  }
+
+  const normalizedPreview = normalizeModelText(previewTranscript);
+  const translationApiKey = getTranslationApiKey(session.settings);
+  const latencyProfile = getLatencyBehaviorProfile(session.settings?.latencyPreference);
+  const sequenceId = session.sequenceId + 1;
+
+  if (sequenceId !== session.nextDisplaySequenceId) {
+    clearSpeculativeTranslationState(sequenceId);
+    return;
+  }
+
+  if (!translationApiKey || !normalizedPreview || normalizedPreview.length < latencyProfile.deepgramSpeculativeMinChars) {
+    clearSpeculativeTranslationState(sequenceId);
+    return;
+  }
+
+  const speculativeState = session.speculativeTranslation;
+  if (speculativeState.sequenceId !== sequenceId) {
+    clearSpeculativeTranslationState();
+  }
+
+  if (
+    speculativeState.sequenceId === sequenceId &&
+    speculativeState.sourceText === normalizedPreview &&
+    (speculativeState.debounceTimer || speculativeState.abortController || speculativeState.emittedText)
+  ) {
+    return;
+  }
+
+  speculativeState.version += 1;
+  speculativeState.sequenceId = sequenceId;
+  speculativeState.sourceText = normalizedPreview;
+  speculativeState.emittedText = "";
+
+  if (speculativeState.debounceTimer) {
+    clearTimeout(speculativeState.debounceTimer);
+  }
+
+  if (speculativeState.abortController) {
+    speculativeState.abortController.abort();
+    speculativeState.abortController = null;
+  }
+
+  const version = speculativeState.version;
+  debugLog("translation:speculative-schedule", {
+    sessionId: session.sessionId,
+    sequenceId,
+    chars: normalizedPreview.length,
+    debounceMs: latencyProfile.deepgramSpeculativeDebounceMs
+  });
+  speculativeState.debounceTimer = setTimeout(() => {
+    speculativeState.debounceTimer = null;
+    void runSpeculativeTranslation({
+      sequenceId,
+      sourceText: normalizedPreview,
+      version
+    });
+  }, latencyProfile.deepgramSpeculativeDebounceMs);
+}
+
+function clearSpeculativeTranslationState(sequenceId = null) {
+  const speculativeState = session.speculativeTranslation;
+  if (!speculativeState) {
+    return;
+  }
+
+  if (sequenceId != null && speculativeState.sequenceId !== sequenceId) {
+    return;
+  }
+
+  if (speculativeState.debounceTimer) {
+    clearTimeout(speculativeState.debounceTimer);
+    speculativeState.debounceTimer = null;
+  }
+
+  if (speculativeState.abortController) {
+    speculativeState.abortController.abort();
+    speculativeState.abortController = null;
+  }
+
+  speculativeState.sequenceId = 0;
+  speculativeState.sourceText = "";
+  speculativeState.emittedText = "";
+  speculativeState.version += 1;
+}
+
+function isCurrentSpeculativeTranslation(sequenceId, sourceText, version) {
+  const speculativeState = session.speculativeTranslation;
+  return (
+    !session.isStopping &&
+    session.sttProvider === STT_PROVIDERS.deepgram &&
+    speculativeState.sequenceId === sequenceId &&
+    speculativeState.sourceText === sourceText &&
+    speculativeState.version === version
+  );
+}
+
+async function runSpeculativeTranslation({ sequenceId, sourceText, version }) {
+  if (!isCurrentSpeculativeTranslation(sequenceId, sourceText, version)) {
+    return;
+  }
+
+  const translationApiKey = getTranslationApiKey(session.settings);
+  if (!translationApiKey) {
+    clearSpeculativeTranslationState(sequenceId);
+    return;
+  }
+
+  const abortController = new AbortController();
+  session.speculativeTranslation.abortController = abortController;
+  let bestPartial = "";
+
+  debugLog("translation:speculative-start", {
+    sessionId: session.sessionId,
+    sequenceId,
+    provider: session.settings.translationProvider,
+    model: session.settings.translationProvider === TRANSLATION_PROVIDERS.gemini ? getGeminiModel(session.settings) : null,
+    chars: sourceText.length
+  });
+
+  try {
+    const translation = await translateWithProviderAttempt({
+      provider: session.settings.translationProvider,
+      apiKey: translationApiKey,
+      model: getGeminiModel(session.settings),
+      sourceLang: session.settings.sourceLang,
+      targetLang: session.settings.targetLang,
+      text: sourceText,
+      signal: abortController.signal,
+      onPartialUpdate: async (partialTranslation) => {
+        const normalized = normalizeModelText(partialTranslation);
+        if (!normalized || !isCurrentSpeculativeTranslation(sequenceId, sourceText, version)) {
+          return;
+        }
+
+        bestPartial = selectPreferredPartial(bestPartial, normalized);
+        await emitSpeculativeTranslation(sequenceId, sourceText, bestPartial, version);
+      }
+    });
+
+    const finalTranslation = normalizeModelText(translation) || bestPartial;
+    if (!finalTranslation || !isCurrentSpeculativeTranslation(sequenceId, sourceText, version)) {
+      return;
+    }
+
+    await emitSpeculativeTranslation(sequenceId, sourceText, finalTranslation, version);
+    debugLog("translation:speculative-complete", {
+      sessionId: session.sessionId,
+      sequenceId,
+      chars: finalTranslation.length
+    });
+  } catch (error) {
+    if (abortController.signal.aborted || error?.name === "AbortError") {
+      return;
+    }
+
+    const normalizedError = normalizeTranslationError(error);
+    debugLog("translation:speculative-error", {
+      sessionId: session.sessionId,
+      sequenceId,
+      provider: session.settings.translationProvider,
+      reason: getTranslationErrorCode(normalizedError),
+      status: Number.isFinite(normalizedError?.status) ? normalizedError.status : null,
+      message: normalizedError.message || String(normalizedError)
+    });
+  } finally {
+    if (session.speculativeTranslation.abortController === abortController) {
+      session.speculativeTranslation.abortController = null;
+    }
+  }
+}
+
+async function emitSpeculativeTranslation(sequenceId, sourceText, translation, version) {
+  if (!isCurrentSpeculativeTranslation(sequenceId, sourceText, version)) {
+    return;
+  }
+
+  if (sequenceId !== session.nextDisplaySequenceId) {
+    return;
+  }
+
+  const normalizedTranslation = normalizeModelText(translation);
+  if (!normalizedTranslation || normalizedTranslation === session.speculativeTranslation.emittedText) {
+    return;
+  }
+
+  session.speculativeTranslation.emittedText = normalizedTranslation;
+  await notifyBackground({
+    type: MESSAGE_TYPES.finalTranslation,
+    translation: normalizedTranslation,
+    sourceText,
+    sequenceId,
+    isFinal: false
+  });
 }
 
 function extractFinalTokensFromPayload(payload, transcript) {
@@ -1182,22 +1876,7 @@ async function flushPendingTokens(reason, { endIndexAbsolute = session.finalWord
 
   session.lastEmittedWordIndex = safeEndIndex;
   compactFinalWordBuffer();
-
-  await notifyBackground({
-    type: MESSAGE_TYPES.finalTranscript,
-    transcript: text,
-    sequenceId
-  });
-
-  enqueueTranslationTask({
-    sequenceId,
-    text,
-    provider: session.settings.translationProvider,
-    model: getGeminiModel(session.settings),
-    sourceLang: session.settings.sourceLang,
-    targetLang: session.settings.targetLang,
-    apiKey: getTranslationApiKey(session.settings)
-  });
+  await emitFinalTranscriptSegment(text, sequenceId);
 }
 
 function enqueueTranslationTask(task) {
@@ -1470,7 +2149,7 @@ async function flushReadyTranslationResults(sessionId) {
       provider: readyTranslation.provider
     });
 
-    await notifyBackground({
+    void notifyBackground({
       type: MESSAGE_TYPES.finalTranslation,
       translation: readyTranslation.translation,
       sourceText: readyTranslation.sourceText,
@@ -1567,7 +2246,7 @@ async function emitStreamingTranslationUpdate(task, translation, sessionId) {
   }
 
   if (task.sequenceId === session.nextDisplaySequenceId) {
-    await notifyBackground({
+    void notifyBackground({
       type: MESSAGE_TYPES.finalTranslation,
       translation,
       sourceText: task.text,
@@ -1601,7 +2280,7 @@ async function flushCurrentStreamingTranslation(sessionId) {
     sequenceId: session.nextDisplaySequenceId,
     provider: streamingTranslation.provider
   });
-  await notifyBackground({
+  void notifyBackground({
     type: MESSAGE_TYPES.finalTranslation,
     translation: streamingTranslation.translation,
     sourceText: streamingTranslation.sourceText,
@@ -1631,6 +2310,10 @@ function createEmptySession() {
   return {
     tabId: null,
     settings: null,
+    sttProvider: STT_PROVIDERS.deepgram,
+    sttTransport: STT_TRANSPORTS.websocket,
+    sttConnectionState: STT_CONNECTION_STATES.idle,
+    utteranceIndex: 0,
     deepgram: null,
     connection: null,
     audioContext: null,
@@ -1647,6 +2330,12 @@ function createEmptySession() {
     finalWordBuffer: [],
     lastEmittedWordIndex: 0,
     latestInterimTail: "",
+    xaiCurrentTurn: null,
+    xaiPreRollChunks: [],
+    xaiTurnQueue: [],
+    isPumpingXaiTurnQueue: false,
+    xaiConsecutiveTurnFailures: 0,
+    transcriptionAbortControllers: new Set(),
     translationQueue: [],
     activeTranslationCount: 0,
     isPumpingTranslationQueue: false,
@@ -1654,6 +2343,7 @@ function createEmptySession() {
     completedTranslations: new Map(),
     translationStreamingResults: new Map(),
     streamingPartialState: new Map(),
+    speculativeTranslation: createEmptySpeculativeTranslationState(),
     nextDisplaySequenceId: 1,
     lastInterimLogAt: 0,
     streamingLoggedSequenceIds: new Set(),
@@ -1661,12 +2351,38 @@ function createEmptySession() {
     currentSilentForMs: 0,
     hasReceivedAudio: false,
     isStopping: false,
+    runtimeSessionId: null,
     sessionId: nextSessionId++
+  };
+}
+
+function createEmptySpeculativeTranslationState() {
+  return {
+    sequenceId: 0,
+    sourceText: "",
+    emittedText: "",
+    version: 0,
+    debounceTimer: null,
+    abortController: null
   };
 }
 
 function getSegmentationProfile(mode) {
   return SEGMENTATION_PROFILES[mode] || SEGMENTATION_PROFILES.balanced;
+}
+
+function getLatencyBehaviorProfile(preference) {
+  return LATENCY_BEHAVIOR_PROFILES[preference] || LATENCY_BEHAVIOR_PROFILES[DEFAULT_SETTINGS.latencyPreference];
+}
+
+function getXaiTurnProfile(mode, latencyPreference = DEFAULT_SETTINGS.latencyPreference) {
+  const profile = getSegmentationProfile(mode);
+  const latencyProfile = getLatencyBehaviorProfile(latencyPreference);
+  return {
+    silenceFlushMs: Math.max(220, profile.endpointingMs + 90 + latencyProfile.xaiSilenceOffsetMs),
+    maxTurnMs: Math.max(1100, Math.round(profile.maxDurationMs * 0.72) + latencyProfile.xaiMaxTurnOffsetMs),
+    preRollMs: Math.min(320, Math.max(90, profile.softLookaheadMs + 60 + latencyProfile.xaiPreRollOffsetMs))
+  };
 }
 
 function mergeTranscriptBuffer(existingText, nextText) {
@@ -1866,6 +2582,15 @@ function mapDeepgramLanguage(language) {
   return mapping[language] || language;
 }
 
+function mapXaiLanguage(language) {
+  const mapping = {
+    en: "en",
+    ja: "ja"
+  };
+
+  return mapping[language] || "";
+}
+
 function labelForLanguage(language) {
   const mapping = {
     en: "English",
@@ -1898,6 +2623,52 @@ function getTranslationApiKey(settings) {
   return settings.geminiApiKey;
 }
 
+function getSttProvider(settings) {
+  const providerValue = String(
+    settings?.sttProvider ??
+      settings?.speechProvider ??
+      settings?.transcriptionProvider ??
+      settings?.sttEngine ??
+      ""
+  )
+    .trim()
+    .toLowerCase();
+
+  return XAI_PROVIDER_ALIASES.has(providerValue) ? STT_PROVIDERS.xai : STT_PROVIDERS.deepgram;
+}
+
+function getXaiApiKey(settings) {
+  return (
+    settings?.xaiApiKey ||
+    settings?.grokApiKey ||
+    settings?.sttApiKey ||
+    settings?.speechApiKey ||
+    ""
+  );
+}
+
+function getSttTransport(settings) {
+  if (getSttProvider(settings) === STT_PROVIDERS.xai) {
+    return STT_TRANSPORTS.https;
+  }
+
+  return STT_TRANSPORTS.websocket;
+}
+
+function getSessionStartingMessage(provider, transport) {
+  if (provider === STT_PROVIDERS.xai) {
+    return "xAI 音声認識を準備しています…";
+  }
+
+  return "Deepgram に接続しています…";
+}
+
+function getSpeechDetectedMessage(provider, transport) {
+  return provider === STT_PROVIDERS.xai
+    ? "タブ音声ストリームを受信しました。発話区切りを監視しています…"
+    : "タブ音声を検出しました。文字起こしを待っています…";
+}
+
 function getGeminiModel(settings) {
   return settings?.geminiModel || DEFAULT_SETTINGS.geminiModel;
 }
@@ -1905,6 +2676,38 @@ function getGeminiModel(settings) {
 function decodeHtmlEntities(text) {
   htmlEntityDecoder.innerHTML = String(text || "");
   return htmlEntityDecoder.value;
+}
+
+function cloneAudioBuffer(audioBuffer) {
+  return audioBuffer instanceof ArrayBuffer ? audioBuffer.slice(0) : new ArrayBuffer(0);
+}
+
+function getPcmDurationMs(audioBuffer) {
+  return Math.max(0, Math.round((audioBuffer.byteLength / PCM_BYTES_PER_SAMPLE / TARGET_SAMPLE_RATE) * 1000));
+}
+
+function mergePcmChunks(chunks) {
+  const sampleCount = chunks.reduce(
+    (total, chunk) => total + Math.floor((chunk?.audioBuffer?.byteLength || 0) / PCM_BYTES_PER_SAMPLE),
+    0
+  );
+  if (!sampleCount) {
+    return new ArrayBuffer(0);
+  }
+
+  const mergedBuffer = new ArrayBuffer(sampleCount * PCM_BYTES_PER_SAMPLE);
+  const mergedView = new DataView(mergedBuffer);
+  let byteOffset = 0;
+
+  for (const chunk of chunks) {
+    const samples = new Int16Array(chunk.audioBuffer);
+    for (let index = 0; index < samples.length; index += 1) {
+      mergedView.setInt16(byteOffset, samples[index], true);
+      byteOffset += PCM_BYTES_PER_SAMPLE;
+    }
+  }
+
+  return mergedBuffer;
 }
 
 function getOrCreateStreamingPartialState(sequenceId) {
@@ -1945,6 +2748,168 @@ function clearAllStreamingPartialState() {
   }
 
   session.streamingPartialState.clear();
+}
+
+async function emitFinalTranscriptSegment(text, sequenceId = ++session.sequenceId, metadata = {}) {
+  const transcript = normalizeModelText(text);
+  if (!transcript || session.isStopping) {
+    return;
+  }
+
+  debugLog("transcript:emit-final", {
+    sessionId: session.sessionId,
+    sequenceId,
+    sttProvider: session.sttProvider,
+    chars: transcript.length
+  });
+
+  void notifyBackground({
+    type: MESSAGE_TYPES.finalTranscript,
+    transcript,
+    sequenceId,
+    sttTransport: session.sttTransport,
+    sttConnectionState: session.sttConnectionState,
+    utteranceIndex: session.utteranceIndex,
+    providerEvent: metadata.providerEvent || null,
+    isUtteranceFinal: Boolean(metadata.isUtteranceFinal)
+  });
+
+  clearSpeculativeTranslationState(sequenceId);
+  enqueueTranslationTask({
+    sequenceId,
+    text: transcript,
+    provider: session.settings.translationProvider,
+    model: getGeminiModel(session.settings),
+    sourceLang: session.settings.sourceLang,
+    targetLang: session.settings.targetLang,
+    apiKey: getTranslationApiKey(session.settings)
+  });
+}
+
+function createTranscriptionError(code, message, extra = {}) {
+  const error = new Error(message);
+  error.code = code;
+  Object.assign(error, extra);
+  return error;
+}
+
+function normalizeTranscriptionError(error) {
+  if (!error) {
+    return createTranscriptionError("unknown", "文字起こし処理で不明なエラーが発生しました。");
+  }
+
+  if (error.code) {
+    return error;
+  }
+
+  if (error instanceof TypeError) {
+    return createTranscriptionError("network", error.message || "xAI への接続に失敗しました。");
+  }
+
+  return createTranscriptionError("unknown", error.message || String(error), {
+    status: Number.isFinite(error?.status) ? error.status : null,
+    cause: error
+  });
+}
+
+function getTranscriptionErrorCode(error) {
+  return error?.code || "unknown";
+}
+
+function isRetryableTranscriptionStatus(status) {
+  return status === 408 || status === 429 || status >= 500;
+}
+
+function isSkippableTranscriptionStatus(status) {
+  return status === 408 || status === 429 || status === 502 || status === 503 || status === 504;
+}
+
+function shouldRetryTranscriptionError(error) {
+  const code = getTranscriptionErrorCode(error);
+  if (["timeout", "network", "empty"].includes(code)) {
+    return true;
+  }
+
+  const status = Number(error?.status);
+  return isRetryableTranscriptionStatus(status);
+}
+
+function shouldSkipTranscriptionError(error) {
+  const code = getTranscriptionErrorCode(error);
+  if (["timeout", "network", "empty"].includes(code)) {
+    return true;
+  }
+
+  const status = Number(error?.status);
+  return isSkippableTranscriptionStatus(status);
+}
+
+async function handleSkippedXaiTurn(error, sessionId) {
+  session.xaiConsecutiveTurnFailures += 1;
+  const consecutiveFailures = session.xaiConsecutiveTurnFailures;
+  const reason = getTranscriptionErrorCode(error);
+  const status = Number.isFinite(error?.status) ? error.status : null;
+
+  debugLog("xai:skip-turn", {
+    sessionId,
+    reason,
+    status,
+    consecutiveFailures,
+    message: error?.message || String(error)
+  });
+
+  if (consecutiveFailures >= 3) {
+    await handleFatalError(
+      createTranscriptionError(
+        "unavailable",
+        "xAI の文字起こしに連続で失敗しました。API キー、ネットワーク、利用制限を確認してください。",
+        { status }
+      )
+    );
+    return;
+  }
+
+  await notifyBackground({
+    type: MESSAGE_TYPES.sessionStatusChanged,
+    status: SESSION_STATUS.active,
+    message: getXaiTurnFailureMessage(error, consecutiveFailures),
+    sttTransport: session.sttTransport,
+    sttConnectionState: session.sttConnectionState,
+    utteranceIndex: session.utteranceIndex
+  });
+}
+
+function getXaiTurnFailureMessage(error, consecutiveFailures) {
+  const parts = [];
+  const code = getTranscriptionErrorCode(error);
+  const status = Number.isFinite(error?.status) ? error.status : null;
+
+  if (code && code !== "unknown") {
+    parts.push(code);
+  }
+
+  if (status != null) {
+    parts.push(`HTTP ${status}`);
+  }
+
+  const detail = parts.length ? ` (${parts.join(" / ")})` : "";
+  return `xAI の文字起こしに一時失敗しました${detail}。次の区間で再試行します… (${consecutiveFailures}/3)`;
+}
+
+async function maybeFlushPendingXaiTurn(reason) {
+  if (session.sttProvider !== STT_PROVIDERS.xai || !session.xaiCurrentTurn) {
+    return;
+  }
+
+  const flushReason = getXaiTurnFlushReason(getXaiTurnProfile(session.settings?.segmentationMode, session.settings?.latencyPreference));
+  if (flushReason) {
+    await flushCurrentXaiTurn(`${reason}:${flushReason}`);
+    return;
+  }
+
+  if (session.xaiCurrentTurn.speechMs >= XAI_MIN_SPEECH_MS) {
+    await flushCurrentXaiTurn(`${reason}:force`);
+  }
 }
 
 function selectStableStreamingText(previousText, nextText) {
@@ -1988,13 +2953,88 @@ function getSharedPrefixLength(leftText, rightText) {
 }
 
 async function notifyBackground(message) {
-  try {
-    await chrome.runtime.sendMessage({
+  const payload = buildBackgroundMessage(message);
+
+  if (!GUARDED_BACKGROUND_MESSAGE_TYPES.has(message.type)) {
+    return sendBackgroundMessage(payload);
+  }
+
+  return enqueueGuardedBackgroundMessage(payload);
+}
+
+function buildBackgroundMessage(message) {
+  const runtimeSessionId = message.runtimeSessionId ?? session.runtimeSessionId;
+
+  if (runtimeSessionId == null) {
+    return {
       recipient: "background",
       ...message
+    };
+  }
+
+  return {
+    recipient: "background",
+    runtimeSessionId,
+    ...message
+  };
+}
+
+function enqueueGuardedBackgroundMessage(message) {
+  return new Promise((resolve) => {
+    backgroundDeliveryQueue.push({
+      attempts: 0,
+      message,
+      resolve
     });
+    void pumpBackgroundDeliveryQueue();
+  });
+}
+
+async function pumpBackgroundDeliveryQueue() {
+  if (isPumpingBackgroundDeliveryQueue) {
+    return;
+  }
+
+  isPumpingBackgroundDeliveryQueue = true;
+
+  try {
+    while (backgroundDeliveryQueue.length) {
+      const entry = backgroundDeliveryQueue[0];
+      const delivered = await sendBackgroundMessage(entry.message);
+      if (delivered) {
+        backgroundDeliveryQueue.shift();
+        entry.resolve(true);
+        continue;
+      }
+
+      entry.attempts += 1;
+      if (entry.attempts >= BACKGROUND_DELIVERY_MAX_ATTEMPTS) {
+        debugLog("background:drop", {
+          attempts: entry.attempts,
+          runtimeSessionId: entry.message.runtimeSessionId || null,
+          type: entry.message.type
+        });
+        backgroundDeliveryQueue.shift();
+        entry.resolve(false);
+        continue;
+      }
+
+      await sleep(BACKGROUND_DELIVERY_RETRY_BASE_MS * entry.attempts);
+    }
+  } finally {
+    isPumpingBackgroundDeliveryQueue = false;
+    if (backgroundDeliveryQueue.length) {
+      void pumpBackgroundDeliveryQueue();
+    }
+  }
+}
+
+async function sendBackgroundMessage(message) {
+  try {
+    await chrome.runtime.sendMessage(message);
+    return true;
   } catch {
-    // service worker may be waking up
+    return false;
   }
 }
 
@@ -2020,5 +3060,5 @@ function maybeLogInterimProgress() {
 }
 
 function debugLog(event, details = {}) {
-  console.info(DEBUG_LOG_PREFIX, event, details);
+  runtimeLogger(event, details);
 }

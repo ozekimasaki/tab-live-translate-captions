@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "tab-live-translate-captions",
-  "description": "Realtime translated caption overlay for any page using Deepgram, Cloud Translation, and Gemini.",
+  "description": "Realtime translated caption overlay for any page using Deepgram or xAI STT with Cloud Translation and Gemini.",
   "version": "0.1.0",
   "permissions": [
     "activeTab",
@@ -13,6 +13,7 @@
   "host_permissions": [
     "<all_urls>",
     "https://api.deepgram.com/*",
+    "https://api.x.ai/*",
     "https://generativelanguage.googleapis.com/*",
     "https://translation.googleapis.com/*"
   ],
