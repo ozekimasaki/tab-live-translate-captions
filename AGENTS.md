@@ -18,9 +18,9 @@
 - バンドルは [`build.mjs`](build.mjs) の `esbuild` で行います。
 - エントリーポイントは `background.js`、`content.js`、`popup.js`、`offscreen.js`、`audio-worklet.js` です。
 - 出力形式は IIFE、ターゲットは Chrome 120 です。
-- 現在のビルドコマンドは `npm run build` のみです。
-- 追加の runtime dependency は `@deepgram/sdk` のみです。
-- lint / test script はまだありません。確認は `npm run build` と実機確認が基本です。
+- 定義済みの npm script は `npm run build`（`node build.mjs`）のみです。
+- 追加の runtime dependency は `@deepgram/sdk` のみ、devDependency は `esbuild` のみです。
+- lint / test / typecheck script はまだありません。確認は `npm run build` の成功と `dist/` を使った実機確認が基本です。
 
 ## 主要ファイル
 
@@ -35,7 +35,9 @@
 - [`src/constants.js`](src/constants.js)
   storage key、表示モード、字幕区切りモード、翻訳プロバイダ、Gemini モデル、言語ペア、デフォルト設定、メッセージ種別、セッション状態の共通契約です。
 - [`src/storage.js`](src/storage.js)
-  `chrome.storage.local` に対する settings / sessionState / runtimeLogs の薄いラッパーです。
+  `chrome.storage.local` に対する settings / sessionState / runtime logs の薄いラッパーです。runtime logs は source ごとに `runtimeLogsBackground` / `runtimeLogsOffscreen` の 2 キーで保持し、`getRuntimeLogs()` で timestamp 順にマージして返します。
+- [`src/runtime-log.js`](src/runtime-log.js)
+  `createRuntimeLogger()` を提供し、`console.info` 出力と `chrome.storage.local` への永続化を行います。event 種別ごとに flush 間隔を絞り、API key / Authorization / token などの秘密情報を再帰的に redact します。
 - [`src/ui-copy.js`](src/ui-copy.js)
   popup / overlay の表示文言、選択肢定義、状態表示の view model をまとめています。
 - [`src/page-support.js`](src/page-support.js)
@@ -70,7 +72,7 @@
 - 言語ペアは `PRESET_LANGUAGE_PAIRS` に限定されています。`background.js` の `normalizeSettings()` が source language に対応する target language へ正規化し、`validateSettings()` が不正ペアを拒否します。
 - STT provider は `DEFAULT_SETTINGS.sttProvider` と `STT_PROVIDERS` が契約です。現在は `deepgram` / `xai` を持ち、xAI 用 API key は `xaiApiKey` に保存します。
 - xAI STT は現在 `英語` / `日本語` 入力のみ対応です。`中国語 → 日本語` を使う場合は `Deepgram` を選ぶ前提です。
-- `chrome.storage.local` 上の永続状態は `settings`、`sessionState`、`runtimeLogs` です。読み書きは `src/storage.js` を通す前提です。
+- `chrome.storage.local` 上の永続状態は `settings`、`sessionState`、`runtimeLogsBackground`、`runtimeLogsOffscreen` です。storage key は `src/constants.js` の `STORAGE_KEYS` が正で、読み書きは `src/storage.js` を通す前提です。runtime log の書き込みは `src/runtime-log.js` の logger 経由に統一します。
 - active session のランタイム正本は offscreen document 側です。`background.js` は起動時と `GET_STATE` 時に offscreen 不在 / タブ消滅を検知すると stale session を cleanup します。
 - `src/offscreen.js` は `audio-worklet.js` が bundle され、かつ `web_accessible_resources` に含まれている前提です。移動や改名時は `build.mjs` と `public/manifest.json` を両方更新します。
 - `src/content.js` は `window.__deepframOverlayController` の `exportState()` / `destroy()` で再注入時の状態を引き継ぎます。fullscreen 時は host 要素へ再配置します。この挙動は壊しやすいです。
@@ -86,7 +88,7 @@
 - extension-only の xAI は短い発話区間ごとの HTTPS STT を前提にし、低遅延化は local VAD と flush 設定で詰めます。
 - popup で見える runtime logs は上限付きの recent diagnostics です。完全な telemetry / 永続監査ログとしては扱いません。
 - popup から runtime logs を表示 / コピー / クリアできる前提です。
-- API キーなどの秘密情報をログ出力しません。
+- API キーなどの秘密情報をログ出力しません。sanitize は `src/runtime-log.js` が担うので、独自に生ログを storage へ書かないでください。
 
 ## 変更時の指針
 
