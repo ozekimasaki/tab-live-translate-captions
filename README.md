@@ -215,6 +215,13 @@ API キーは `chrome.storage.local` に保存します。サーバー中継は�
 - 低遅延モードは速さ優先なので、細かく切れやすいです
 - 短い字幕の読みづらさは、現在は自動保持である程度吸収されます
 
+## 開発コマンド
+
+- `npm install` — 依存関係のインストール
+- `npm run build` — `esbuild`（`build.mjs`）で `src/` と `public/` から `dist/` を生成
+
+lint / test / typecheck 用の npm script は現在ありません。確認は `npm run build` の成功と `dist/` を Chrome の unpacked extension として読み込む実機確認が基本です。
+
 ## 開発メモ
 
 - `npm run build` で `src/` と `public/` から `dist/` を生成します
@@ -224,18 +231,28 @@ API キーは `chrome.storage.local` に保存します。サーバー中継は�
 ## ファイル構成
 
 - `src/background.js`
-  - セッション開始/停止、offscreen 制御、content script 注入
+  - セッション開始/停止、設定の normalize / validate、offscreen 制御、content script 注入、badge 更新、stale session cleanup
 - `src/offscreen.js`
-  - タブ音声取得、AudioWorklet、Deepgram STT、xAI STT、Cloud Translation / Gemini 翻訳
+  - タブ音声取得、AudioWorklet、Deepgram STT、xAI STT、Cloud Translation / Gemini 翻訳、retry / fallback
 - `src/content.js`
-  - ページ上の字幕オーバーレイ描画、ドラッグ移動、状態表示
+  - ページ上の字幕オーバーレイ描画、ドラッグ移動、fullscreen 再配置、状態表示
 - `src/popup.js`
   - popup UI、設定保存、runtime log viewer
+- `src/constants.js`
+  - storage key、表示モード、プロバイダ、Gemini モデル、言語ペア、デフォルト設定、メッセージ種別などの共通定義
+- `src/storage.js`
+  - `chrome.storage.local` に対する settings / sessionState / runtime logs のラッパー
+- `src/runtime-log.js`
+  - runtime log の生成、秘密情報の redact、`chrome.storage.local` への永続化
+- `src/page-support.js`
+  - 非対応プロトコル / ホストの判定
 - `src/ui-copy.js`
   - UI 文言、ラベル、状態表示
 - `src/audio-worklet.js`
   - PCM 変換と音量通知
 - `public/manifest.json`
   - MV3 manifest、権限、popup、icon 定義
+- `public/offscreen.html` / `public/popup.html` / `public/popup.css` / `public/content.css`
+  - offscreen / popup のエントリ HTML と各種スタイル
 - `build.mjs`
-  - ビルドスクリプト
+  - `esbuild` によるビルドスクリプト（`src/` を bundle し `public/` を `dist/` へコピー）
